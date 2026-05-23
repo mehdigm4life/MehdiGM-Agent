@@ -8,6 +8,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -43,14 +47,21 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("Explorer – ${startPath.substringAfterLast('/')}") },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) } },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = null)
+                    }
+                },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = PrimaryPurple)
             )
         }
     ) { padding ->
         rootNode?.let { node ->
             LazyColumn(
-                Modifier.fillMaxSize().padding(padding).background(Color(0xFF111111))
+                Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .background(Color(0xFF111111))
             ) {
                 items(node.children) { child ->
                     Row(
@@ -58,13 +69,12 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
                             .fillMaxWidth()
                             .clickable {
                                 if (child.isDirectory) vm.loadDirectory(child.file.absolutePath)
-                                // else you could add file opening logic here
                             }
                             .padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = if (child.isDirectory) Icons.Default.Folder else Icons.Default.Description,
+                            imageVector = if (child.isDirectory) Icons.Filled.Folder else Icons.Filled.Description,
                             contentDescription = null,
                             tint = if (child.isDirectory) PrimaryPurple else Color.White,
                             modifier = Modifier.size(20.dp)
