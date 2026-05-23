@@ -43,7 +43,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun bindConversation(conversationId: String) {
         if (_state.value.conversationId == conversationId) return
-        _state.value = _state.value.copy(conversationId = conversationId, messages = emptyList(), consoleLines = emptyList(), toolInvocations = emptyList())
+        // Reset UI for the new conversation
+        _state.value = _state.value.copy(
+            conversationId = conversationId,
+            messages = emptyList(),
+            consoleLines = emptyList(),
+            toolInvocations = emptyList()
+        )
         viewModelScope.launch {
             appCtx.chatRepository.observeMessages(conversationId).collect { msgs ->
                 _state.value = _state.value.copy(messages = msgs)
@@ -60,13 +66,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(consoleLines = emptyList(), toolInvocations = emptyList())
     }
 
+    /**
+     * Starts a new agent task. Each user message gets its **own** console area –
+     * we clear previous consoleLines and toolInvocations before executing the
+     * new task so that every task has an isolated console view.
+     */
     fun send(text: String) {
         if (text.isBlank() || _state.value.isStreaming) return
         val convId = _state.value.conversationId ?: return
-        val settings = appCtx.settingsRepository
+        val settingsRepo = appCtx.settingsRepository
+
+        // Prepare a fresh console for this task
+        _state.value = _state.value.copy(
+            consoleLines = emptyList(),
+            toolInvocations = emptyList()
+        )
 
         runJob = viewModelScope.launch {
-            val current = settings.settingsFlow.first()
+            val current = settingsRepo.settingsFlow.first()
             val providerCfg = current.providers[current.activeProviderId]
             if (providerCfg == null || providerCfg.apiKey.isBlank() && providerCfg.providerId !in listOf("ollama", "lmstudio", "custom")) {
                 _state.value = _state.value.copy(errorMessage = "Please configure an API key for ${current.activeProviderId} in Settings.")
@@ -81,12 +98,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val userMsg = ChatMessage(id = UUID.randomUUID().toString(), role = Role.USER, content = text)
             appCtx.chatRepository.saveMessage(convId, userMsg)
 
+            // Update UI state before the agent runs
             _state.value = _state.value.copy(
                 isStreaming = true,
                 streamingAssistantText = "",
                 errorMessage = null,
                 currentTaskName = text.lines().firstOrNull()?.take(80) ?: "Task",
-                consoleLines = _state.value.consoleLines + ConsoleLine("User: ${text.take(200)}", "info")
+                consoleLines = listOf(ConsoleLine("User: ${text.take(200)}", "info"))
             )
 
             val history = appCtx.chatRepository.getMessages(convId).filter { it.id != userMsg.id }
