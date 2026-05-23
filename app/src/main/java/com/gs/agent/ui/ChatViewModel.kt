@@ -90,7 +90,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             )
 
             val history = appCtx.chatRepository.getMessages(convId).filter { it.id != userMsg.id }
-            val allHistory = history + userMsg
 
             executor.run(
                 history = history,

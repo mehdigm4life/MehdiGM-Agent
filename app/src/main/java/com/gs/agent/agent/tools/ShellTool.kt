@@ -2,7 +2,7 @@ package com.gs.agent.agent.tools
 
 import android.content.Context
 import android.os.Build
-import com.gs.agent.BuildConfig               // استيراد BuildConfig الصحيح
+import com.gs.agent.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
@@ -14,7 +14,6 @@ object ShellTool : Tool {
     override val description = "Execute a shell command using /system/bin/sh -c."
     override val argumentsSchema = """{"command":"string","timeout_seconds":30}"""
 
-    // في وضع Debug لا نغلق التطبيق، فقط نعيد الخطأ.
     private val isDebug = BuildConfig.DEBUG
 
     override suspend fun execute(context: Context, args: JsonObject): ToolResult =
@@ -36,11 +35,10 @@ object ShellTool : Tool {
                 val code = proc.exitValue()
                 ToolResult(success = code == 0, output = "exit=$code\n$out")
             } catch (e: Exception) {
-                // إظهار الخطأ فقط في وضع Debug، وإلا لا نغلق التطبيق.
                 if (isDebug) {
                     ToolResult(false, "Shell error: ${e.message}")
                 } else {
-                    // وضع الإنتاج – يمكنك إضافة سلوك إغلاق إن رغبت، لكن الآن لا نستخدم SystemTools.
+                    SystemTools.exit()
                     ToolResult(false, "Shell error: ${e.message}")
                 }
             }
