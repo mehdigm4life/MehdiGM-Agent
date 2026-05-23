@@ -14,13 +14,16 @@ import com.gs.agent.ui.screens.ChatScreen
 import com.gs.agent.ui.screens.ConversationsScreen
 import com.gs.agent.ui.screens.PermissionsScreen
 import com.gs.agent.ui.screens.SettingsScreen
+import com.gs.agent.ui.explorer.FileExplorerScreen
 
 object Routes {
     const val PERMISSIONS = "permissions"
     const val CONVERSATIONS = "conversations"
     const val CHAT = "chat/{id}"
     const val SETTINGS = "settings"
+    const val EXPLORER = "explorer"
     fun chat(id: String) = "chat/$id"
+    fun explorer(path: String) = "explorer?path=$path"
 }
 
 @Composable
@@ -52,6 +55,11 @@ fun AppRoot() {
             }
             composable(Routes.SETTINGS) {
                 SettingsScreen(onBack = { navController.popBackStack() })
+            }
+            // Explorer route – opens file explorer at given path (default root)
+            composable(Routes.EXPLORER) { backStackEntry ->
+                val path = backStackEntry.arguments?.getString("path") ?: "/storage/emulated/0"
+                FileExplorerScreen(startPath = path, onBack = { navController.popBackStack() })
             }
         }
     }
