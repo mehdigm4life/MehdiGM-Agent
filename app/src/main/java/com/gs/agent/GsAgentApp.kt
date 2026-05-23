@@ -12,17 +12,24 @@ import java.io.InputStreamReader
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class GsAgentApp : Application() {
     val database by lazy { AppDatabase.getInstance(this) }
     val settingsRepository by lazy { SettingsRepository(this) }
     val chatRepository by lazy { ChatRepository(database.chatDao()) }
 
+    // Flag to ensure we dump logcat only once per crash
+    private val hasDumped = AtomicBoolean(false)
+
     override fun onCreate() {
         super.onCreate()
         instance = this
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            dumpLogcat()
+            if (hasDumped.compareAndSet(false, true)) {
+                dumpLogcat()
+            }
+            // Let the original handler (if any) continue the crash flow
             Thread.getDefaultUncaughtExceptionHandler()?.uncaughtException(thread, throwable)
         }
     }
@@ -37,11 +44,11 @@ class GsAgentApp : Application() {
             val targetDir = File("/storage/emulated/0/AndroidCSProjects")
             if (!targetDir.exists()) targetDir.mkdirs()
             val logFile = File(targetDir, "logcat.log")
-            // Get current process id – this filters the logcat to our app only.
             val pid = Process.myPid()
-            val process = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "threadtime", "--pid", pid.toString()))
-            val reader = InputStreamReader(process.inputStream)
-            val output = reader.readText()
+            val process = Runtime.getRuntime().exec(
+                arrayOf("logcat", "-d", "-v", "threadtime", "--pid", pid.toString())
+            )
+            val output = InputStreamReader(process.inputStream).readText()
             val header = "\n=== LOGCAT DUMP @ ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())} (pid=$pid) ===\n"
             FileOutputStream(logFile, true).use { fos ->
                 fos.write(header.toByteArray())
