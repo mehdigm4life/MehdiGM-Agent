@@ -22,7 +22,7 @@ import androidx.compose.material.icons.outlined.Clear
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Person
-import androidx.compose.material.icons.automirrored.filled.Send as SendIcon
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material.icons.outlined.Terminal
@@ -378,7 +378,7 @@ private fun InputBar(
                 )
             ) {
                 Icon(
-                    if (isStreaming) Icons.Outlined.Stop else SendIcon,
+                    if (isStreaming) Icons.Outlined.Stop else Icons.AutoMirrored.Filled.Send,
                     contentDescription = null,
                     tint = Color.White,
                     modifier = Modifier.size(18.dp)
