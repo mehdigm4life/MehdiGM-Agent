@@ -12,9 +12,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ==== Checkout مع تمرير PAT (GH_PAT) ====
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
 
+      # ==== إعداد JDK 17 ====
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -22,6 +28,7 @@ jobs:
           java-version: 17
           cache: gradle
 
+      # ==== تثبيت Android SDK ====
       - name: Install Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -32,17 +39,20 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
+      # ==== تأكيد إعداد الذاكرة ====
       - name: Verify gradle.properties heap size
         run: |
           grep -q "org.gradle.jvmargs=-Xmx4g" gradle.properties || \
           echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" >> gradle.properties
 
+      # ==== بناء Debug و Release ====
       - name: Assemble Debug
         run: bash ./gradlew assembleDebug --no-daemon
 
       - name: Assemble Release
         run: bash ./gradlew assembleRelease --no-daemon
 
+      # ==== رفع الـ artifacts ====
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
