@@ -378,7 +378,7 @@ private fun InputBar(
                 )
             ) {
                 Icon(
-                    if (isStreaming) Icons.Outlined.Stop else Icons.Outlined.Send,
+                    if (isStreaming) Icons.Outlined.Stop else SendIcon,
                     contentDescription = null,
                     tint = Color.White,
                     modifier = Modifier.size(18.dp)
