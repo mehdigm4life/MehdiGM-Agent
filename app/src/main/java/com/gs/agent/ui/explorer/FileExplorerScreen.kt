@@ -14,7 +14,10 @@ import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -34,7 +37,10 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
     LaunchedEffect(Unit) { permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE) }
 
     if (!hasPermission) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
             Text("Waiting for storage permission...", color = Color.White)
         }
         return@Composable
@@ -59,18 +65,16 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
     ) { padding ->
         rootNode?.let { node ->
             LazyColumn(
-                Modifier
+                modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
                     .background(Color(0xFF111111))
             ) {
                 items(node.children) { child ->
                     Row(
-                        Modifier
+                        modifier = Modifier
                             .fillMaxWidth()
-                            .clickable {
-                                if (child.isDirectory) vm.loadDirectory(child.file.absolutePath)
-                            }
+                            .clickable { if (child.isDirectory) vm.loadDirectory(child.file.absolutePath) }
                             .padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -87,7 +91,10 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
                 }
             }
         } ?: run {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
                 CircularProgressIndicator(color = PrimaryPurple)
             }
         }
