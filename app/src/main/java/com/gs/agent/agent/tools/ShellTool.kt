@@ -1,7 +1,6 @@
 package com.gs.agent.agent.tools
 
 import android.content.Context
-import android.os.Build
 import com.gs.agent.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -38,7 +37,8 @@ object ShellTool : Tool {
                 if (isDebug) {
                     ToolResult(false, "Shell error: ${e.message}")
                 } else {
-                    SystemTools.exit()
+                    // في وضع الإنتاج يمكنك إلغاء التعليق لإغلاق التطبيق
+                    // SystemTools.exit()
                     ToolResult(false, "Shell error: ${e.message}")
                 }
             }
