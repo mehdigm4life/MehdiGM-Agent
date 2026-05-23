@@ -1,4 +1,3 @@
-//
 package com.gs.agent.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
