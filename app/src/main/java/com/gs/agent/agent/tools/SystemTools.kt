@@ -47,7 +47,7 @@ fun registerDefaultTools() {
     ToolRegistry.register(MoveFileTool)
     ToolRegistry.register(SearchFilesTool)
     ToolRegistry.register(FileInfoTool)
-    ToolRegistry.register(EditFileTool)
+    
     ToolRegistry.register(ShellTool)
     ToolRegistry.register(DeviceInfoTool)
     ToolRegistry.register(CurrentTimeTool)
