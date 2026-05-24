@@ -331,3 +331,24 @@ data class ToolInvocation(
 
 @Serializable
 enum class ToolStatus { PENDING, RUNNING, SUCCESS, ERROR, BLOCKED }
+
+/**
+ * Per-task console state — each user-initiated task gets its own console.
+ */
+data class TaskConsoleState(
+    val taskId: String,                    // matches the user message ID that started the task
+    val toolInvocations: List<ToolInvocation> = emptyList(),
+    val consoleLines: List<UiConsoleLine> = emptyList(),
+    val isExpanded: Boolean = true,
+    val isFinished: Boolean = false,
+    val errorMessage: String? = null,
+    val taskName: String = ""
+)
+
+data class UiConsoleLine(
+    val text: String,
+    val kind: ConsoleLineKind,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+enum class ConsoleLineKind { INFO, TOOL, OUTPUT, ERROR }

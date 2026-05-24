@@ -6,9 +6,12 @@ import androidx.lifecycle.viewModelScope
 import com.gs.agent.GsAgentApp
 import com.gs.agent.agent.executor.AgentExecutor
 import com.gs.agent.data.models.ChatMessage
+import com.gs.agent.data.models.ConsoleLineKind
 import com.gs.agent.data.models.Role
+import com.gs.agent.data.models.TaskConsoleState
 import com.gs.agent.data.models.ToolInvocation
 import com.gs.agent.data.models.ToolStatus
+import com.gs.agent.data.models.UiConsoleLine
 import com.gs.agent.data.providers.AiClient
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,15 +21,14 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.util.UUID
 
-data class ConsoleLine(val text: String, val kind: String, val timestamp: Long = System.currentTimeMillis())
-
 data class ChatUiState(
     val conversationId: String? = null,
     val messages: List<ChatMessage> = emptyList(),
     val streamingAssistantText: String = "",
     val isStreaming: Boolean = false,
-    val toolInvocations: List<ToolInvocation> = emptyList(),
-    val consoleLines: List<ConsoleLine> = emptyList(),
+    /** Per-task consoles — each user message gets its own console */
+    val taskConsoles: Map<String, TaskConsoleState> = emptyMap(),
+    val activeTaskId: String? = null,
     val errorMessage: String? = null,
     val currentTaskName: String? = null
 )
@@ -43,12 +45,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun bindConversation(conversationId: String) {
         if (_state.value.conversationId == conversationId) return
-        // Reset UI for the new conversation
         _state.value = _state.value.copy(
             conversationId = conversationId,
             messages = emptyList(),
-            consoleLines = emptyList(),
-            toolInvocations = emptyList()
+            taskConsoles = emptyMap(),
+            activeTaskId = null
         )
         viewModelScope.launch {
             appCtx.chatRepository.observeMessages(conversationId).collect { msgs ->
@@ -59,28 +60,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         runJob?.cancel()
-        _state.value = _state.value.copy(isStreaming = false)
+        _state.value = _state.value.copy(isStreaming = false, activeTaskId = null)
     }
 
-    fun clearConsole() {
-        _state.value = _state.value.copy(consoleLines = emptyList(), toolInvocations = emptyList())
+    /** Toggle the expanded/collapsed state of a task's console */
+    fun toggleTaskConsole(taskId: String) {
+        val current = _state.value.taskConsoles[taskId] ?: return
+        _state.value = _state.value.copy(
+            taskConsoles = _state.value.taskConsoles + (taskId to current.copy(isExpanded = !current.isExpanded))
+        )
     }
 
     /**
-     * Starts a new agent task. Each user message gets its **own** console area –
-     * we clear previous consoleLines and toolInvocations before executing the
-     * new task so that every task has an isolated console view.
+     * Each user message is a new "task" with its own dedicated console.
+     * We create a fresh TaskConsoleState for it.
      */
     fun send(text: String) {
         if (text.isBlank() || _state.value.isStreaming) return
         val convId = _state.value.conversationId ?: return
         val settingsRepo = appCtx.settingsRepository
 
-        // Prepare a fresh console for this task
-        _state.value = _state.value.copy(
-            consoleLines = emptyList(),
-            toolInvocations = emptyList()
-        )
+        // Generate a task ID — corresponds to the user message that starts it
+        val taskId = UUID.randomUUID().toString()
 
         runJob = viewModelScope.launch {
             val current = settingsRepo.settingsFlow.first()
@@ -95,19 +96,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             // Persist user message
-            val userMsg = ChatMessage(id = UUID.randomUUID().toString(), role = Role.USER, content = text)
+            val userMsg = ChatMessage(id = taskId, role = Role.USER, content = text)
             appCtx.chatRepository.saveMessage(convId, userMsg)
 
-            // Update UI state before the agent runs
+            // Create a dedicated console for this task
+            val taskName = text.lines().firstOrNull()?.take(80) ?: "Task"
+            val initialConsole = TaskConsoleState(
+                taskId = taskId,
+                taskName = taskName,
+                consoleLines = listOf(UiConsoleLine("🚀 Starting task: $taskName", ConsoleLineKind.INFO)),
+                isExpanded = true
+            )
+
             _state.value = _state.value.copy(
                 isStreaming = true,
                 streamingAssistantText = "",
                 errorMessage = null,
-                currentTaskName = text.lines().firstOrNull()?.take(80) ?: "Task",
-                consoleLines = listOf(ConsoleLine("User: ${text.take(200)}", "info"))
+                currentTaskName = taskName,
+                activeTaskId = taskId,
+                taskConsoles = _state.value.taskConsoles + (taskId to initialConsole)
             )
 
-            val history = appCtx.chatRepository.getMessages(convId).filter { it.id != userMsg.id }
+            val history = appCtx.chatRepository.getMessages(convId).filter { it.id != taskId }
 
             executor.run(
                 history = history,
@@ -115,38 +125,77 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 config = providerCfg,
                 settings = current,
                 emit = { ev ->
+                    val currentState = _state.value
+                    val taskConsole = currentState.taskConsoles[taskId] ?: return@run
+
                     when (ev) {
                         is AgentExecutor.Event.AssistantDelta -> {
-                            _state.value = _state.value.copy(
-                                streamingAssistantText = _state.value.streamingAssistantText + ev.text
+                            _state.value = currentState.copy(
+                                streamingAssistantText = currentState.streamingAssistantText + ev.text
                             )
                         }
                         is AgentExecutor.Event.AssistantMessage -> {
                             appCtx.chatRepository.saveMessage(convId, ev.message)
-                            _state.value = _state.value.copy(streamingAssistantText = "")
+                            _state.value = currentState.copy(streamingAssistantText = "")
                         }
                         is AgentExecutor.Event.ToolStart -> {
-                            _state.value = _state.value.copy(
-                                toolInvocations = _state.value.toolInvocations + ev.invocation
+                            _state.value = currentState.copy(
+                                taskConsoles = currentState.taskConsoles + (taskId to taskConsole.copy(
+                                    toolInvocations = taskConsole.toolInvocations + ev.invocation,
+                                    consoleLines = taskConsole.consoleLines + UiConsoleLine(
+                                        "▶ ${ev.invocation.name} ${ev.invocation.arguments.take(120)}",
+                                        ConsoleLineKind.TOOL
+                                    )
+                                ))
                             )
                         }
                         is AgentExecutor.Event.ToolFinish -> {
-                            _state.value = _state.value.copy(
-                                toolInvocations = _state.value.toolInvocations.map {
-                                    if (it.name == ev.invocation.name && it.status == ToolStatus.RUNNING) ev.invocation else it
-                                }
+                            val updatedInvocations = taskConsole.toolInvocations.map {
+                                if (it.name == ev.invocation.name && it.status == ToolStatus.RUNNING) ev.invocation else it
+                            }
+                            val statusLabel = if (ev.invocation.status == ToolStatus.SUCCESS) "✅" else "❌"
+                            _state.value = currentState.copy(
+                                taskConsoles = currentState.taskConsoles + (taskId to taskConsole.copy(
+                                    toolInvocations = updatedInvocations,
+                                    consoleLines = taskConsole.consoleLines + UiConsoleLine(
+                                        "$statusLabel ${ev.invocation.name} — ${if (ev.invocation.status == ToolStatus.SUCCESS) "Success" else "Error"}: ${ev.invocation.result?.take(200) ?: ""}",
+                                        if (ev.invocation.status == ToolStatus.SUCCESS) ConsoleLineKind.OUTPUT else ConsoleLineKind.ERROR
+                                    )
+                                ))
                             )
                         }
                         is AgentExecutor.Event.ConsoleLine -> {
-                            _state.value = _state.value.copy(
-                                consoleLines = _state.value.consoleLines + ConsoleLine(ev.text, ev.kind.name.lowercase())
+                            val kind = when (ev.kind) {
+                                AgentExecutor.ConsoleKind.INFO -> ConsoleLineKind.INFO
+                                AgentExecutor.ConsoleKind.TOOL -> ConsoleLineKind.TOOL
+                                AgentExecutor.ConsoleKind.OUTPUT -> ConsoleLineKind.OUTPUT
+                                AgentExecutor.ConsoleKind.ERROR -> ConsoleLineKind.ERROR
+                            }
+                            _state.value = currentState.copy(
+                                taskConsoles = currentState.taskConsoles + (taskId to taskConsole.copy(
+                                    consoleLines = taskConsole.consoleLines + UiConsoleLine(ev.text, kind)
+                                ))
                             )
                         }
                         is AgentExecutor.Event.Error -> {
-                            _state.value = _state.value.copy(errorMessage = ev.message)
+                            _state.value = currentState.copy(
+                                errorMessage = ev.message,
+                                taskConsoles = currentState.taskConsoles + (taskId to taskConsole.copy(
+                                    consoleLines = taskConsole.consoleLines + UiConsoleLine("❌ Error: ${ev.message}", ConsoleLineKind.ERROR),
+                                    errorMessage = ev.message
+                                ))
+                            )
                         }
                         AgentExecutor.Event.Done -> {
-                            _state.value = _state.value.copy(isStreaming = false, currentTaskName = null)
+                            _state.value = currentState.copy(
+                                isStreaming = false,
+                                currentTaskName = null,
+                                activeTaskId = null,
+                                taskConsoles = currentState.taskConsoles + (taskId to taskConsole.copy(
+                                    isFinished = true,
+                                    consoleLines = taskConsole.consoleLines + UiConsoleLine("✓ Task completed.", ConsoleLineKind.INFO)
+                                ))
+                            )
                         }
                     }
                 }
