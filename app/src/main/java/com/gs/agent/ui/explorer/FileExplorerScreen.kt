@@ -14,6 +14,8 @@ import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,6 +36,7 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasPermission = granted }
 
+    // Request storage permission once
     LaunchedEffect(Unit) { permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE) }
 
     if (!hasPermission) {
@@ -47,7 +50,8 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
     }
 
     val vm: FileExplorerViewModel = viewModel()
-    LaunchedEffect(startPath) { vm.loadDirectory(startPath) }
+    // Load the initial directory when the composable enters composition
+    LaunchedEffect(key1 = startPath) { vm.loadDirectory(startPath) }
     val rootNode by vm.root.collectAsState()
 
     Scaffold(
