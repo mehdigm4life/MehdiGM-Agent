@@ -40,7 +40,7 @@ fun FileExplorerScreen(startPath: String = "/storage/emulated/0", onBack: () -> 
         ) {
             Text("Waiting for storage permission...", color = Color.White)
         }
-        return@Composable
+        return
     }
 
     val vm: FileExplorerViewModel = viewModel()
