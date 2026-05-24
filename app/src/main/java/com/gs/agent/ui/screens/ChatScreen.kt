@@ -525,13 +525,13 @@ private fun HeaderRow(console: TaskConsoleState, isLive: Boolean, onToggle: () -
 @Composable
 private fun Badge(isLive: Boolean, console: TaskConsoleState) {
     val (text, bg, fg) = when {
-        isLive -> "RUNNING" to WarningOrange.copy(alpha = 0.15f) to WarningOrange
-        console.errorMessage != null -> "ERROR" to ErrorRed.copy(alpha = 0.15f) to ErrorRed
-        console.isFinished -> "DONE" to SuccessGreen.copy(alpha = 0.15f) to SuccessGreen
+        isLive -> Triple("RUNNING", WarningOrange.copy(alpha = 0.15f), WarningOrange)
+        console.errorMessage != null -> Triple("ERROR", ErrorRed.copy(alpha = 0.15f), ErrorRed)
+        console.isFinished -> Triple("DONE", SuccessGreen.copy(alpha = 0.15f), SuccessGreen)
         else -> {
             val done = console.toolInvocations.count { it.status == ToolStatus.SUCCESS }
             val total = console.toolInvocations.size
-            "$done/$total" to Color(0xFF2A2A38) to Color(0xFFB0B0C0)
+            Triple("$done/$total", Color(0xFF2A2A38), Color(0xFFB0B0C0))
         }
     }
     Surface(color = bg, shape = RoundedCornerShape(6.dp)) {
@@ -659,7 +659,7 @@ private fun EmptyChatHint() {
         Text("What can I help you with?", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
         Spacer(Modifier.height(8.dp))
         Text(
-            "Try asking me to list files, create a project,\nrun a shell command, or get device info.",
+            "Try asking me to list files, create a project,\\nrun a shell command, or get device info.",
             color = Color(0xFF8B8B9A),
             fontSize = 13.sp,
             lineHeight = 18.sp,
