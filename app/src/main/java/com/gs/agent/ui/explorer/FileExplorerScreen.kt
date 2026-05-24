@@ -26,7 +26,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.compose.runtime.Composable
 import com.gs.agent.ui.theme.PrimaryPurple
 
 @OptIn(ExperimentalMaterial3Api::class)
