@@ -1,6 +1,7 @@
 package com.gs.agent.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.*
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
@@ -15,33 +16,24 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.AutoAwesome
-import androidx.compose.material.icons.outlined.Build
-import androidx.compose.material.icons.outlined.CheckCircle
-import androidx.compose.material.icons.outlined.Error
-import androidx.compose.material.icons.outlined.ExpandLess
-import androidx.compose.material.icons.outlined.ExpandMore
-import androidx.compose.material.icons.outlined.Person
-import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material.icons.outlined.Stop
-import androidx.compose.material.icons.outlined.Terminal
-import androidx.compose.material.icons.outlined.HourglassTop
-import androidx.compose.material.icons.outlined.TaskAlt
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -51,13 +43,26 @@ import com.gs.agent.data.models.Role
 import com.gs.agent.data.models.TaskConsoleState
 import com.gs.agent.data.models.ToolInvocation
 import com.gs.agent.data.models.ToolStatus
-import com.gs.agent.ui.ChatUiState
+import com.gs.agent.data.models.UiConsoleLine
 import com.gs.agent.ui.ChatViewModel
-import com.gs.agent.ui.theme.AccentCyan
-import com.gs.agent.ui.theme.ErrorRed
-import com.gs.agent.ui.theme.PrimaryPurple
-import com.gs.agent.ui.theme.SuccessGreen
-import com.gs.agent.ui.theme.WarningOrange
+import com.gs.agent.ui.DisplayTaskGroup
+import com.gs.agent.ui.buildDisplayGroups
+import com.gs.agent.ui.theme.*
+
+// ──────────────────────────────────────────────────────────────────────────
+// Colors
+// ──────────────────────────────────────────────────────────────────────────
+private val UserBubble = PrimaryPurple
+private val UserText = Color.White
+private val AsstBubble = Color(0xFF1A1A26)
+private val AsstText = Color(0xFFE8E8F0)
+private val SurfaceBg = Color(0xFF14141B)
+private val ConsoleBg = Color(0xFF0D0D14)
+private val BorderDim = Color(0xFF2A2A38)
+
+// ──────────────────────────────────────────────────────────────────────────
+// Screen
+// ──────────────────────────────────────────────────────────────────────────
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -69,14 +74,20 @@ fun ChatScreen(conversationId: String, onBack: () -> Unit, onSettings: () -> Uni
     val focus = LocalFocusManager.current
     val listState = rememberLazyListState()
 
-    // Auto-scroll to bottom
-    LaunchedEffect(state.messages.size, state.streamingAssistantText) {
-        val total = state.messages.size + (if (state.streamingAssistantText.isNotEmpty()) 1 else 0)
-        if (total > 0) listState.animateScrollToItem(total - 1)
+    // Build unified display groups (DB + live streaming merged into one list)
+    val displayGroups = remember(state.messages, state.streamingAssistantText, state.taskConsoles, state.activeTaskId) {
+        buildDisplayGroups(state.messages, state.streamingAssistantText, state.taskConsoles, state.activeTaskId)
+    }
+
+    // Auto-scroll to bottom when groups change or streaming text changes
+    LaunchedEffect(displayGroups.size, state.streamingAssistantText) {
+        if (displayGroups.isNotEmpty()) {
+            listState.animateScrollToItem(displayGroups.size - 1)
+        }
     }
 
     Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
+        containerColor = Color(0xFF0A0A0F),
         topBar = {
             TopAppBar(
                 title = {
@@ -85,7 +96,11 @@ fun ChatScreen(conversationId: String, onBack: () -> Unit, onSettings: () -> Uni
                         state.currentTaskName?.let {
                             Text(it, fontSize = 11.sp, color = AccentCyan, maxLines = 1)
                         } ?: run {
-                            Text(if (state.isStreaming) "Working…" else "Ready", fontSize = 11.sp, color = Color(0xFF9999A8))
+                            Text(
+                                if (state.isStreaming) "Working…" else "Ready",
+                                fontSize = 11.sp,
+                                color = Color(0xFF9999A8)
+                            )
                         }
                     }
                 },
@@ -95,62 +110,52 @@ fun ChatScreen(conversationId: String, onBack: () -> Unit, onSettings: () -> Uni
                     }
                 },
                 actions = {
-                    IconButton(onClick = onSettings) { Icon(Icons.Outlined.Settings, contentDescription = null) }
+                    IconButton(onClick = onSettings) {
+                        Icon(Icons.Outlined.Settings, contentDescription = null)
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
             )
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            // Messages list with per-task consoles
+
+            // ── Message list ──
             LazyColumn(
                 state = listState,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                if (state.messages.isEmpty() && state.streamingAssistantText.isEmpty()) {
+                if (displayGroups.isEmpty()) {
                     item { EmptyChatHint() }
                 }
 
-                // Group messages: user + assistant pairs get a console attached to the assistant
-                val groupedMessages = buildMessageGroups(state)
-                items(groupedMessages, key = { it.key }) { group ->
-                    MessageGroup(
+                items(displayGroups, key = { it.key }) { group ->
+                    TaskGroupCard(
                         group = group,
-                        state = state,
-                        onToggleConsole = { taskId -> vm.toggleTaskConsole(taskId) }
+                        onToggleConsole = { vm.toggleTaskConsole(it) }
                     )
-                }
-
-                // Streaming assistant text with its live console
-                if (state.streamingAssistantText.isNotEmpty()) {
-                    item {
-                        val activeConsole = state.activeTaskId?.let { state.taskConsoles[it] }
-                        StreamingMessage(
-                            text = state.streamingAssistantText,
-                            console = activeConsole,
-                            isExpanded = activeConsole?.isExpanded ?: true,
-                            onToggleConsole = {
-                                state.activeTaskId?.let { vm.toggleTaskConsole(it) }
-                            }
-                        )
-                    }
                 }
             }
 
-            // Global error
+            // ── Error banner ──
             state.errorMessage?.let { err ->
                 Surface(
                     color = ErrorRed.copy(alpha = 0.12f),
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                     shape = RoundedCornerShape(10.dp)
                 ) {
-                    Text(err, color = ErrorRed, modifier = Modifier.padding(10.dp), fontSize = 12.sp)
+                    Text(
+                        err,
+                        color = ErrorRed,
+                        modifier = Modifier.padding(10.dp),
+                        fontSize = 12.sp
+                    )
                 }
             }
 
-            // Input bar
+            // ── Input bar ──
             InputBar(
                 value = input,
                 onChange = { input = it },
@@ -169,195 +174,240 @@ fun ChatScreen(conversationId: String, onBack: () -> Unit, onSettings: () -> Uni
     }
 }
 
-// =========================================================================
-// Grouping logic — each user message becomes a "task" with its own console
-// =========================================================================
-
-private data class MessageGroupData(
-    val key: String,
-    val userMessage: ChatMessage?,
-    val assistantMessage: ChatMessage?,
-    val taskConsole: TaskConsoleState?
-)
-
-private fun buildMessageGroups(state: ChatUiState): List<MessageGroupData> {
-    val groups = mutableListOf<MessageGroupData>()
-    var i = 0
-    val msgs = state.messages
-    while (i < msgs.size) {
-        val msg = msgs[i]
-        if (msg.role == Role.USER) {
-            val nextAssistant = if (i + 1 < msgs.size && msgs[i + 1].role == Role.ASSISTANT) msgs[i + 1] else null
-            val console = state.taskConsoles[msg.id]
-            groups.add(MessageGroupData(
-                key = msg.id,
-                userMessage = msg,
-                assistantMessage = nextAssistant,
-                taskConsole = console
-            ))
-            if (nextAssistant != null) i += 2 else i += 1
-        } else if (msg.role == Role.ASSISTANT) {
-            groups.add(MessageGroupData(
-                key = msg.id,
-                userMessage = null,
-                assistantMessage = msg,
-                taskConsole = null
-            ))
-            i += 1
-        } else {
-            i += 1
-        }
-    }
-    return groups
-}
-
-// =========================================================================
-// Message Group Composable — user bubble + assistant bubble + per-task console
-// =========================================================================
+// ──────────────────────────────────────────────────────────────────────────
+// Task Group Card — ONE item = USER + ASSISTANT + CONSOLE
+// ──────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun MessageGroup(
-    group: MessageGroupData,
-    state: ChatUiState,
+private fun TaskGroupCard(
+    group: DisplayTaskGroup,
     onToggleConsole: (String) -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        // User message bubble
-        group.userMessage?.let { userMsg ->
-            MessageBubble(msg = userMsg, isUser = true)
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        // ── User bubble (top-right) ──
+        group.userMessage?.let { user ->
+            UserBubble(user)
         }
 
-        // Assistant message bubble (if present)
-        group.assistantMessage?.let { asstMsg ->
-            MessageBubble(msg = asstMsg, isUser = false)
-        }
-
-        // Per-task console card — attached directly under the assistant message
-        group.taskConsole?.let { console ->
-            TaskConsoleCard(
-                console = console,
-                onToggle = { onToggleConsole(console.taskId) }
-            )
-        }
-    }
-}
-
-// =========================================================================
-// Streaming Message — live assistant text + its live console
-// =========================================================================
-
-@Composable
-private fun StreamingMessage(
-    text: String,
-    console: TaskConsoleState?,
-    isExpanded: Boolean,
-    onToggleConsole: () -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        // Streaming assistant text bubble
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Start
-        ) {
-            Box(
-                Modifier.size(30.dp).background(
-                    Brush.linearGradient(listOf(PrimaryPurple, AccentCyan)),
-                    RoundedCornerShape(10.dp)
-                ),
-                contentAlignment = Alignment.Center
+        // ── Assistant content (avatar + bubble + console) ──
+        val hasAssistantText = group.assistantMessage != null || group.streamingAssistantText.isNotEmpty()
+        if (hasAssistantText || group.console != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Start
             ) {
-                Icon(
-                    Icons.Outlined.AutoAwesome,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(16.dp)
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            Surface(
-                color = MaterialTheme.colorScheme.surface,
-                shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
-                modifier = Modifier.widthIn(max = 320.dp)
-            ) {
-                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                    Text(
-                        text = text + " ▍",
-                        color = Color(0xFFE8E8F0),
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp
-                    )
+                // Avatar column
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.width(32.dp)
+                ) {
+                    AgentAvatar()
+
+                    // Connector line
+                    if (group.console != null) {
+                        Box(
+                            modifier = Modifier
+                                .width(2.dp)
+                                .height(20.dp)
+                                .background(
+                                    brush = Brush.verticalGradient(
+                                        listOf(AccentCyan.copy(alpha = 0.4f), AccentCyan.copy(alpha = 0.1f))
+                                    ),
+                                    shape = RoundedCornerShape(1.dp)
+                                )
+                        )
+                    }
+                }
+
+                Spacer(Modifier.width(8.dp))
+
+                // Content column
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    // Assistant message bubble
+                    if (hasAssistantText) {
+                        AssistantBubble(
+                            text = group.assistantMessage?.content ?: "",
+                            streamingText = group.streamingAssistantText,
+                            isStreaming = group.isStreaming
+                        )
+                    }
+
+                    // Per-task console
+                    group.console?.let { console ->
+                        TaskConsoleCard(
+                            console = console,
+                            onToggle = { onToggleConsole(console.taskId) },
+                            isLive = group.isStreaming
+                        )
+                    }
                 }
             }
         }
-
-        // Live console for the current streaming task
-        console?.let {
-            TaskConsoleCard(
-                console = it,
-                onToggle = onToggleConsole,
-                isLive = true
-            )
-        }
     }
 }
 
-// =========================================================================
-// Message Bubble — user or assistant
-// =========================================================================
+// ──────────────────────────────────────────────────────────────────────────
+// User bubble (right-aligned, purple)
+// ──────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun MessageBubble(msg: ChatMessage, isUser: Boolean) {
+private fun UserBubble(msg: ChatMessage) {
     Row(
-        Modifier.fillMaxWidth(),
-        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.End
     ) {
-        if (!isUser) {
-            Box(
-                Modifier.size(30.dp).background(
-                    Brush.linearGradient(listOf(PrimaryPurple, AccentCyan)),
-                    RoundedCornerShape(10.dp)
-                ),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(Icons.Outlined.AutoAwesome, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
-            }
-            Spacer(Modifier.width(8.dp))
-        }
-
         Surface(
-            color = if (isUser) PrimaryPurple else MaterialTheme.colorScheme.surface,
+            color = UserBubble,
             shape = RoundedCornerShape(
-                topStart = 16.dp, topEnd = 16.dp,
-                bottomStart = if (isUser) 16.dp else 4.dp,
-                bottomEnd = if (isUser) 4.dp else 16.dp
+                topStart = 20.dp, topEnd = 20.dp,
+                bottomStart = 20.dp, bottomEnd = 6.dp
             ),
             modifier = Modifier.widthIn(max = 320.dp)
         ) {
-            Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
                 Text(
                     text = msg.content,
-                    color = if (isUser) Color.White else Color(0xFFE8E8F0),
+                    color = UserText,
                     fontSize = 14.sp,
                     lineHeight = 20.sp
                 )
             }
         }
+        Spacer(Modifier.width(8.dp))
+        // Tiny indicator dot
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .offset(y = 14.dp)
+                .background(UserBubble.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+        )
+    }
+}
 
-        if (isUser) {
-            Spacer(Modifier.width(8.dp))
-            Box(
-                Modifier.size(30.dp).background(MaterialTheme.colorScheme.surface, RoundedCornerShape(10.dp)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(Icons.Outlined.Person, contentDescription = null, tint = Color(0xFF9999A8), modifier = Modifier.size(16.dp))
+// ──────────────────────────────────────────────────────────────────────────
+// Agent avatar
+// ──────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun AgentAvatar() {
+    Box(
+        modifier = Modifier
+            .size(32.dp)
+            .background(
+                Brush.linearGradient(listOf(PrimaryPurple, AccentCyan)),
+                RoundedCornerShape(10.dp)
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            Icons.Outlined.AutoAwesome,
+            contentDescription = null,
+            tint = Color.White,
+            modifier = Modifier.size(16.dp)
+        )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Assistant message bubble (left-aligned, dark surface)
+// ──────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun AssistantBubble(
+    text: String,
+    streamingText: String,
+    isStreaming: Boolean
+) {
+    Surface(
+        color = AsstBubble,
+        shape = RoundedCornerShape(20.dp),
+        modifier = Modifier.widthIn(max = 360.dp),
+        border = BorderStroke(0.5.dp, BorderDim.copy(alpha = 0.4f))
+    ) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+            // Show final text when available, otherwise streaming text
+            val displayText = if (text.isNotEmpty()) text else streamingText
+            if (displayText.isNotEmpty()) {
+                MarkdownText(
+                    text = displayText + (if (isStreaming) " ▍" else ""),
+                    color = AsstText
+                )
             }
         }
     }
 }
 
-// =========================================================================
-// Per-Task Console Card — one per task, independently collapsible
-// =========================================================================
+// ──────────────────────────────────────────────────────────────────────────
+// Light markdown rendering for code blocks
+// ──────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun MarkdownText(text: String, color: Color) {
+    val segments = remember(text) { parseMarkdownSegments(text) }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        for (segment in segments) {
+            when (segment) {
+                is MdSegment.Text -> {
+                    Text(
+                        text = segment.content,
+                        color = color,
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp
+                    )
+                }
+                is MdSegment.CodeBlock -> {
+                    Surface(
+                        color = Color(0xFF07070C),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = segment.content,
+                            color = AccentCyan.copy(alpha = 0.9f),
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 15.sp,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private sealed class MdSegment {
+    data class Text(val content: String) : MdSegment()
+    data class CodeBlock(val content: String) : MdSegment()
+}
+
+private fun parseMarkdownSegments(text: String): List<MdSegment> {
+    val out = mutableListOf<MdSegment>()
+    val regex = Regex("```[a-zA-Z]*\\n([\\s\\S]*?)```", RegexOption.DOT_MATCHES_ALL)
+    var lastEnd = 0
+    for (match in regex.findAll(text)) {
+        val before = text.substring(lastEnd, match.range.first)
+        if (before.isNotBlank()) out.add(MdSegment.Text(before.trimEnd()))
+        val code = match.groupValues[1]
+        if (code.isNotBlank()) out.add(MdSegment.CodeBlock(code.trimEnd()))
+        lastEnd = match.range.last + 1
+    }
+    if (lastEnd < text.length) {
+        val remaining = text.substring(lastEnd)
+        if (remaining.isNotBlank()) out.add(MdSegment.Text(remaining.trimStart()))
+    }
+    return out
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Per-task Console Card — independently collapsible
+// ──────────────────────────────────────────────────────────────────────────
 
 @Composable
 private fun TaskConsoleCard(
@@ -366,213 +416,261 @@ private fun TaskConsoleCard(
     isLive: Boolean = false
 ) {
     Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 36.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
-        color = MaterialTheme.colorScheme.surface,
-        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth(),
+        color = ConsoleBg,
+        shape = RoundedCornerShape(14.dp),
         border = BorderStroke(
-            width = if (isLive) 1.dp else 0.5.dp,
-            color = if (isLive) AccentCyan.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
+            width = if (isLive) 1.5.dp else 0.5.dp,
+            color = if (isLive) AccentCyan.copy(alpha = 0.35f) else BorderDim.copy(alpha = 0.3f)
         )
     ) {
         Column {
-            // ---- Header (always visible, clickable to toggle) ----
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable(onClick = onToggle)
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Status icon
-                val (statusIcon, statusTint) = when {
-                    isLive -> Icons.Outlined.HourglassTop to WarningOrange
-                    console.errorMessage != null -> Icons.Outlined.Error to ErrorRed
-                    console.isFinished -> Icons.Outlined.TaskAlt to SuccessGreen
-                    console.toolInvocations.any { it.status == ToolStatus.RUNNING } -> Icons.Outlined.PlayArrow to AccentCyan
-                    console.toolInvocations.isNotEmpty() -> Icons.Outlined.CheckCircle to SuccessGreen
-                    else -> Icons.Outlined.Terminal to AccentCyan
-                }
-                Icon(statusIcon, contentDescription = null, tint = statusTint, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
+            // ── Header ──
+            HeaderRow(console = console, isLive = isLive, onToggle = onToggle)
 
-                // Task name
-                Text(
-                    console.taskName.take(30),
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 12.sp,
-                    maxLines = 1
-                )
-                Spacer(Modifier.width(6.dp))
-
-                // Stats
-                Text(
-                    "· ${console.toolInvocations.size} tools · ${console.consoleLines.size} lines",
-                    color = Color(0xFF777788),
-                    fontSize = 10.sp
-                )
-
-                Spacer(Modifier.weight(1f))
-
-                // Status badge
-                val badgeText = when {
-                    isLive -> "RUNNING"
-                    console.errorMessage != null -> "ERROR"
-                    console.isFinished -> "DONE"
-                    else -> "${console.toolInvocations.count { it.status == ToolStatus.SUCCESS }}/${console.toolInvocations.size}"
-                }
-                val badgeColor = when {
-                    isLive -> WarningOrange.copy(alpha = 0.2f)
-                    console.errorMessage != null -> ErrorRed.copy(alpha = 0.2f)
-                    console.isFinished -> SuccessGreen.copy(alpha = 0.2f)
-                    else -> Color(0xFF353548)
-                }
-                val badgeTextColor = when {
-                    isLive -> WarningOrange
-                    console.errorMessage != null -> ErrorRed
-                    console.isFinished -> SuccessGreen
-                    else -> Color(0xFFB0B0C0)
-                }
-                Surface(color = badgeColor, shape = RoundedCornerShape(6.dp)) {
-                    Text(
-                        badgeText,
-                        color = badgeTextColor,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
-                }
-
-                Spacer(Modifier.width(4.dp))
-
-                // Expand/collapse chevron
-                Icon(
-                    if (console.isExpanded) Icons.Outlined.ExpandMore else Icons.Outlined.ExpandLess,
-                    contentDescription = null,
-                    tint = Color(0xFF777788),
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-
-            // ---- Tool chips row (always visible when invocations exist) ----
+            // ── Tool chips ──
             if (console.toolInvocations.isNotEmpty()) {
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
-                        .padding(start = 10.dp, end = 10.dp, bottom = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    console.toolInvocations.takeLast(10).forEach { inv ->
-                        PerTaskToolChip(inv)
-                    }
-                }
+                ToolChipsRow(console.toolInvocations)
             }
 
-            // ---- Expandable log area ----
+            // ── Expandable log ──
             AnimatedVisibility(
                 visible = console.isExpanded,
                 enter = expandVertically(),
                 exit = shrinkVertically()
             ) {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 240.dp)
-                        .background(Color(0xFF07070C))
-                ) {
-                    LazyColumn(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        items(console.consoleLines) { line ->
-                            val color = when (line.kind) {
-                                ConsoleLineKind.TOOL -> AccentCyan
-                                ConsoleLineKind.OUTPUT -> SuccessGreen
-                                ConsoleLineKind.ERROR -> ErrorRed
-                                ConsoleLineKind.INFO -> Color(0xFFB0B0C0)
-                            }
-                            val prefix = when (line.kind) {
-                                ConsoleLineKind.TOOL -> "⚡"
-                                ConsoleLineKind.OUTPUT -> "→"
-                                ConsoleLineKind.ERROR -> "✗"
-                                ConsoleLineKind.INFO -> "·"
-                            }
-                            Text(
-                                text = "$prefix ${line.text}",
-                                color = color,
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                lineHeight = 13.sp
-                            )
-                        }
-                    }
-                }
+                ConsoleLog(console.consoleLines)
             }
         }
     }
 }
 
-// =========================================================================
-// Tool Chip for per-task consoles
-// =========================================================================
+@Composable
+private fun HeaderRow(console: TaskConsoleState, isLive: Boolean, onToggle: () -> Unit) {
+    // Pulse animation for live indicator
+    val animatedAlpha = if (isLive) {
+        val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+        val alpha by infiniteTransition.animateFloat(
+            initialValue = 1f,
+            targetValue = 0.3f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(800, easing = EaseInOutCubic),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "pulseAlpha"
+        )
+        alpha
+    } else 1f
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Status icon
+        val statusIcon: ImageVector
+        val statusTint: Color
+
+        when {
+            isLive -> { statusIcon = Icons.Outlined.HourglassTop; statusTint = WarningOrange }
+            console.errorMessage != null -> { statusIcon = Icons.Outlined.Error; statusTint = ErrorRed }
+            console.isFinished -> { statusIcon = Icons.Outlined.TaskAlt; statusTint = SuccessGreen }
+            console.toolInvocations.any { it.status == ToolStatus.RUNNING } -> { statusIcon = Icons.Outlined.PlayArrow; statusTint = AccentCyan }
+            console.toolInvocations.isNotEmpty() -> { statusIcon = Icons.Outlined.CheckCircle; statusTint = SuccessGreen }
+            else -> { statusIcon = Icons.Outlined.Terminal; statusTint = AccentCyan }
+        }
+
+        Icon(
+            statusIcon, contentDescription = null, tint = statusTint,
+            modifier = Modifier.size(18.dp).alpha(animatedAlpha)
+        )
+        Spacer(Modifier.width(8.dp))
+
+        // Task name
+        Text(
+            text = console.taskName.take(30),
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 13.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false)
+        )
+
+        Spacer(Modifier.width(6.dp))
+        Text("•", color = Color(0xFF555568), fontSize = 10.sp)
+        Spacer(Modifier.width(6.dp))
+
+        // Quick stats
+        Text("${console.toolInvocations.size} tools", color = Color(0xFF8888A0), fontSize = 11.sp)
+        Spacer(Modifier.width(8.dp))
+
+        // Badge
+        Badge(isLive = isLive, console = console)
+
+        Spacer(Modifier.width(4.dp))
+
+        // Expand/collapse
+        Icon(
+            if (console.isExpanded) Icons.Outlined.ExpandMore else Icons.Outlined.ExpandLess,
+            contentDescription = null,
+            tint = Color(0xFF666680),
+            modifier = Modifier.size(20.dp)
+        )
+    }
+}
 
 @Composable
-private fun PerTaskToolChip(inv: ToolInvocation) {
-    val (bg, fg) = when (inv.status) {
-        ToolStatus.RUNNING -> WarningOrange.copy(alpha = 0.2f) to WarningOrange
-        ToolStatus.SUCCESS -> SuccessGreen.copy(alpha = 0.18f) to SuccessGreen
-        ToolStatus.ERROR -> ErrorRed.copy(alpha = 0.18f) to ErrorRed
-        ToolStatus.PENDING -> Color(0xFF353548) to Color(0xFFB0B0C0)
-        ToolStatus.BLOCKED -> Color(0xFF353548) to Color(0xFFB0B0C0)
+private fun Badge(isLive: Boolean, console: TaskConsoleState) {
+    val (text, bg, fg) = when {
+        isLive -> "RUNNING" to WarningOrange.copy(alpha = 0.15f) to WarningOrange
+        console.errorMessage != null -> "ERROR" to ErrorRed.copy(alpha = 0.15f) to ErrorRed
+        console.isFinished -> "DONE" to SuccessGreen.copy(alpha = 0.15f) to SuccessGreen
+        else -> {
+            val done = console.toolInvocations.count { it.status == ToolStatus.SUCCESS }
+            val total = console.toolInvocations.size
+            "$done/$total" to Color(0xFF2A2A38) to Color(0xFFB0B0C0)
+        }
     }
-    Surface(color = bg, shape = RoundedCornerShape(16.dp)) {
+    Surface(color = bg, shape = RoundedCornerShape(6.dp)) {
+        Text(
+            text = text, color = fg,
+            fontSize = 9.sp, fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+        )
+    }
+}
+
+@Composable
+private fun ToolChipsRow(invocations: List<ToolInvocation>) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(start = 12.dp, end = 12.dp, bottom = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        invocations.takeLast(12).forEach { inv -> ToolChip(inv) }
+    }
+}
+
+@Composable
+private fun ToolChip(inv: ToolInvocation) {
+    val (bg, fg) = when (inv.status) {
+        ToolStatus.RUNNING -> WarningOrange.copy(alpha = 0.18f) to WarningOrange
+        ToolStatus.SUCCESS -> SuccessGreen.copy(alpha = 0.15f) to SuccessGreen
+        ToolStatus.ERROR -> ErrorRed.copy(alpha = 0.15f) to ErrorRed
+        ToolStatus.PENDING -> Color(0xFF2A2A38) to Color(0xFF909098)
+        ToolStatus.BLOCKED -> Color(0xFF2A2A38) to Color(0xFF909098)
+    }
+    Surface(color = bg, shape = RoundedCornerShape(20.dp)) {
         Row(
-            Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(Icons.Outlined.Build, contentDescription = null, tint = fg, modifier = Modifier.size(10.dp))
-            Spacer(Modifier.width(3.dp))
+            Icon(Icons.Outlined.Build, contentDescription = null, tint = fg, modifier = Modifier.size(11.dp))
+            Spacer(Modifier.width(4.dp))
             Text(inv.name, color = fg, fontSize = 10.sp, fontWeight = FontWeight.Medium)
         }
     }
 }
 
-// =========================================================================
-// Empty state hint
-// =========================================================================
+@Composable
+private fun ConsoleLog(lines: List<UiConsoleLine>) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 260.dp)
+            .background(Color(0xFF06060A))
+    ) {
+        if (lines.isEmpty()) {
+            Text(
+                text = "  Waiting for tool calls…",
+                color = Color(0xFF666680),
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.padding(12.dp)
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                items(lines) { line -> ConsoleLineRow(logLine = line) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConsoleLineRow(logLine: UiConsoleLine) {
+    val color = when (logLine.kind) {
+        ConsoleLineKind.TOOL -> AccentCyan
+        ConsoleLineKind.OUTPUT -> SuccessGreen
+        ConsoleLineKind.ERROR -> ErrorRed
+        ConsoleLineKind.INFO -> Color(0xFFB0B0C0)
+    }
+    val prefix = when (logLine.kind) {
+        ConsoleLineKind.TOOL -> "⚡"
+        ConsoleLineKind.OUTPUT -> "→"
+        ConsoleLineKind.ERROR -> "✗"
+        ConsoleLineKind.INFO -> "·"
+    }
+    Text(
+        text = "$prefix ${logLine.text}",
+        color = color,
+        fontSize = 10.sp,
+        fontFamily = FontFamily.Monospace,
+        lineHeight = 14.sp
+    )
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Empty state
+// ──────────────────────────────────────────────────────────────────────────
 
 @Composable
 private fun EmptyChatHint() {
     Column(
-        Modifier.fillMaxWidth().padding(vertical = 64.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 80.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
-            Modifier.size(64.dp).background(
-                Brush.linearGradient(listOf(PrimaryPurple.copy(alpha = 0.25f), AccentCyan.copy(alpha = 0.25f))),
-                RoundedCornerShape(18.dp)
-            ),
+            modifier = Modifier
+                .size(72.dp)
+                .background(
+                    Brush.linearGradient(
+                        listOf(PrimaryPurple.copy(alpha = 0.2f), AccentCyan.copy(alpha = 0.2f))
+                    ),
+                    RoundedCornerShape(20.dp)
+                ),
             contentAlignment = Alignment.Center
-        ) { Icon(Icons.Outlined.AutoAwesome, contentDescription = null, tint = Color.White) }
-        Spacer(Modifier.height(12.dp))
-        Text("Ask anything", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+        ) {
+            Icon(
+                Icons.Outlined.AutoAwesome,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.8f),
+                modifier = Modifier.size(32.dp)
+            )
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("What can I help you with?", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+        Spacer(Modifier.height(8.dp))
         Text(
-            "Try: \"List files in Download\", \"Create a Hello World project\", or \"What's my device info?\"",
+            "Try asking me to list files, create a project,\nrun a shell command, or get device info.",
             color = Color(0xFF8B8B9A),
-            fontSize = 12.sp,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp)
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            modifier = Modifier.padding(horizontal = 32.dp)
         )
     }
 }
 
-// =========================================================================
+// ──────────────────────────────────────────────────────────────────────────
 // Input bar
-// =========================================================================
+// ──────────────────────────────────────────────────────────────────────────
 
 @Composable
 private fun InputBar(
@@ -583,13 +681,13 @@ private fun InputBar(
     onStop: () -> Unit
 ) {
     Surface(
-        modifier = Modifier.fillMaxWidth().padding(10.dp),
-        color = MaterialTheme.colorScheme.surface,
-        shape = RoundedCornerShape(24.dp),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+        modifier = Modifier.fillMaxWidth().padding(12.dp),
+        color = SurfaceBg,
+        shape = RoundedCornerShape(28.dp),
+        border = BorderStroke(1.dp, BorderDim)
     ) {
         Row(
-            Modifier.padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+            modifier = Modifier.padding(start = 18.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             BasicTextField(
@@ -600,23 +698,27 @@ private fun InputBar(
                 cursorBrush = Brush.linearGradient(listOf(PrimaryPurple, AccentCyan)),
                 decorationBox = { inner ->
                     if (value.isEmpty()) {
-                        Text("Message GS Agent…", color = Color(0xFF666678), fontSize = 14.sp)
+                        Text("Ask GS Agent anything…", color = Color(0xFF555568), fontSize = 14.sp)
                     }
                     inner()
                 }
             )
-            IconButton(
+
+            Spacer(Modifier.width(8.dp))
+
+            FilledIconButton(
                 onClick = if (isStreaming) onStop else onSend,
-                modifier = Modifier.size(40.dp).background(
-                    Brush.linearGradient(listOf(PrimaryPurple, AccentCyan)),
-                    RoundedCornerShape(20.dp)
+                modifier = Modifier.size(44.dp),
+                shape = RoundedCornerShape(22.dp),
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = if (isStreaming) ErrorRed.copy(alpha = 0.2f) else PrimaryPurple
                 )
             ) {
                 Icon(
                     if (isStreaming) Icons.Outlined.Stop else Icons.AutoMirrored.Filled.Send,
                     contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(18.dp)
+                    tint = if (isStreaming) ErrorRed else Color.White,
+                    modifier = Modifier.size(20.dp)
                 )
             }
         }

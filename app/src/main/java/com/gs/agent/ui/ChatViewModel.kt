@@ -33,6 +33,69 @@ data class ChatUiState(
     val currentTaskName: String? = null
 )
 
+/**
+ * Represents one unified display item in the chat list.
+ * Each task = one DisplayTaskGroup containing user msg + assistant text + console.
+ */
+data class DisplayTaskGroup(
+    val key: String,
+    val userMessage: ChatMessage?,
+    /** Final assistant message from DB (null while streaming & not yet saved) */
+    val assistantMessage: ChatMessage?,
+    /** Live streaming text for currently-in-progress tasks */
+    val streamingAssistantText: String,
+    val console: TaskConsoleState?,
+    val isStreaming: Boolean
+)
+
+/** Build unified display groups from DB messages + live streaming state. */
+fun buildDisplayGroups(
+    messages: List<ChatMessage>,
+    streamingText: String,
+    consoles: Map<String, TaskConsoleState>,
+    activeTaskId: String?
+): List<DisplayTaskGroup> {
+    val groups = mutableListOf<DisplayTaskGroup>()
+    var i = 0
+    while (i < messages.size) {
+        val msg = messages[i]
+        if (msg.role == Role.USER) {
+            val nextAssistant = if (i + 1 < messages.size && messages[i + 1].role == Role.ASSISTANT) {
+                messages[i + 1]
+            } else null
+
+            val isActive = msg.id == activeTaskId
+            val streamText = if (isActive) streamingText else ""
+
+            val console = consoles[msg.id]
+
+            groups.add(DisplayTaskGroup(
+                key = msg.id,
+                userMessage = msg,
+                assistantMessage = nextAssistant,
+                streamingAssistantText = streamText,
+                console = console,
+                isStreaming = isActive && streamText.isNotEmpty()
+            ))
+            if (nextAssistant != null) i += 2 else i += 1
+        } else if (msg.role == Role.ASSISTANT) {
+            // Orphan assistant — no preceding user in this batch
+            groups.add(DisplayTaskGroup(
+                key = msg.id,
+                userMessage = null,
+                assistantMessage = msg,
+                streamingAssistantText = "",
+                console = null,
+                isStreaming = false
+            ))
+            i += 1
+        } else {
+            i += 1
+        }
+    }
+    return groups
+}
+
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val appCtx = app as GsAgentApp
     private val aiClient = AiClient()
@@ -73,14 +136,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Each user message is a new "task" with its own dedicated console.
-     * We create a fresh TaskConsoleState for it.
      */
     fun send(text: String) {
         if (text.isBlank() || _state.value.isStreaming) return
         val convId = _state.value.conversationId ?: return
         val settingsRepo = appCtx.settingsRepository
 
-        // Generate a task ID — corresponds to the user message that starts it
         val taskId = UUID.randomUUID().toString()
 
         runJob = viewModelScope.launch {
