@@ -1,0 +1,485 @@
+name: 🛸 Antigravity AI Cloud (Web TUI)
+
+# يعمل هذا الـ workflow على أي repository تضع فيه هذا الملف
+# المسار المطلوب: .github/workflows/antigravity.yml
+# يقوم بتثبيت Google Antigravity CLI (agy) كاملاً على Ubuntu runner
+# ويفتح واجهة الـ TUI الخاصة به على الويب عبر ttyd + Cloudflare Tunnel
+# (TryCloudflare) — يطبع رابط عام يمكنك الدخول منه والتحدث مع الـ agent
+# وتعديل ملفات الـ repo. أي تعديل يتم commit + push تلقائياً.
+#
+# ملاحظة مهمة:
+#   Antigravity CLI هو واجهة TUI تعمل داخل الـ terminal (وليس web server
+#   مثل opencode). لذلك نستخدم ttyd لتحويل الـ terminal إلى صفحة ويب،
+#   ثم نكشفه عبر Cloudflare Quick Tunnel.
+#
+#   عند أول تشغيل سيطلب منك Google Sign-In — افتح الرابط الذي يطبعه
+#   الـ agent في متصفحك المحلي وأكمل عملية تسجيل الدخول.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "كم دقيقة يبقى السيرفر شغّال (الحد الأقصى لـ GitHub Actions = 350 دقيقة ≈ 6 ساعات)"
+        required: true
+        default: "350"
+        type: string
+      auto_commit:
+        description: "هل تريد commit + push تلقائي لأي تعديلات يقوم بها agy على الملفات؟"
+        required: true
+        default: true
+        type: boolean
+      commit_interval_seconds:
+        description: "كل كم ثانية يتم فحص التغييرات وعمل commit (افتراضي 60 ثانية)"
+        required: true
+        default: "60"
+        type: string
+      ttyd_credentials:
+        description: "كلمة سر بسيطة لحماية صفحة الـ TUI (صيغة user:pass) — اتركها فارغة لتعطيل الحماية"
+        required: false
+        default: ""
+        type: string
+
+# نحتاج صلاحية الكتابة على المحتوى لعمل push
+permissions:
+  contents: write
+
+jobs:
+  antigravity-web:
+    name: 🚀 Run Antigravity CLI Web + Cloudflare Tunnel
+    runs-on: ubuntu-latest
+    # الحد الأقصى لـ job في GitHub Actions = 360 دقيقة
+    timeout-minutes: 355
+
+    env:
+      # ===== مزودات النماذج / مفاتيح الـ Antigravity (كلها اختيارية) =====
+      # Antigravity الأساسي يستخدم Google Sign-In، لكن قد تحتاج بعض
+      # المفاتيح الإضافية حسب إعدادات الـ enterprise أو الـ proxy.
+      ANTIGRAVITY_API_KEY:          ${{ secrets.ANTIGRAVITY_API_KEY }}
+      GOOGLE_API_KEY:               ${{ secrets.GOOGLE_API_KEY }}
+      GEMINI_API_KEY:               ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_CLOUD_PROJECT:         ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      # ===== مزودات إضافية في حال أضفتها لـ agy لاحقاً =====
+      ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
+      OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+      GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+      DEEPSEEK_API_KEY:    ${{ secrets.DEEPSEEK_API_KEY }}
+      MISTRAL_API_KEY:     ${{ secrets.MISTRAL_API_KEY }}
+      XAI_API_KEY:         ${{ secrets.XAI_API_KEY }}
+      COHERE_API_KEY:      ${{ secrets.COHERE_API_KEY }}
+      TOGETHER_API_KEY:    ${{ secrets.TOGETHER_API_KEY }}
+      PERPLEXITY_API_KEY:  ${{ secrets.PERPLEXITY_API_KEY }}
+      # نخبر agy بأنه يعمل في بيئة بدون متصفح (يطبع رابط المصادقة في الـ stdout)
+      ANTIGRAVITY_HEADLESS: "1"
+      CI: "true"
+      TERM: "xterm-256color"
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1) جلب كود الـ repository الحالي
+      # -----------------------------------------------------------------------
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # 2) إعداد Node.js (مفيد لبعض الـ tools الجانبية)
+      # -----------------------------------------------------------------------
+      - name: ⚙️ Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # -----------------------------------------------------------------------
+      # 3) تثبيت الأدوات المساعدة + ttyd
+      # -----------------------------------------------------------------------
+      - name: 🛠️ Install system dependencies (+ ttyd)
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            curl unzip jq git ca-certificates procps \
+            tmux gnome-keyring libsecret-1-0 dbus-x11
+
+          # تثبيت ttyd (web terminal) عبر الـ binary الرسمي
+          echo "::group::Installing ttyd binary"
+          TTYD_VER="1.7.7"
+          curl -fsSL -o /usr/local/bin/ttyd \
+            "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.x86_64"
+          sudo chmod +x /usr/local/bin/ttyd
+          ttyd --version || true
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      # 4) تثبيت Antigravity CLI عبر الطريقة الرسمية
+      # -----------------------------------------------------------------------
+      - name: 🛸 Install Google Antigravity CLI (official installer)
+        run: |
+          set -e
+          echo "::group::Installing agy via official installer"
+          curl -fsSL https://antigravity.google/cli/install.sh | bash
+          echo "::endgroup::"
+
+          # المسار الافتراضي للـ binary حسب التوثيق الرسمي
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          which agy || true
+          agy --version || true
+          agy --help    || true
+
+      # -----------------------------------------------------------------------
+      # 5) تثبيت cloudflared
+      # -----------------------------------------------------------------------
+      - name: ☁️ Install cloudflared
+        uses: AnimMouse/setup-cloudflared@v2
+
+      - name: ✅ Verify cloudflared
+        run: cloudflared --version
+
+      # -----------------------------------------------------------------------
+      # 6) إنشاء ملف إعدادات agy (إن لم يكن موجوداً)
+      # -----------------------------------------------------------------------
+      - name: 📝 Prepare Antigravity config
+        run: |
+          mkdir -p "$HOME/.config/antigravity"
+          if [ ! -f "$HOME/.config/antigravity/config.json" ] && [ ! -f ".antigravity/config.json" ]; then
+            cat > "$HOME/.config/antigravity/config.json" <<'JSON'
+          {
+            "theme": "dark",
+            "renderingMode": "alt-screen",
+            "telemetry": false,
+            "autoUpdate": false,
+            "workspaceTrust": "auto-trust"
+          }
+          JSON
+            echo "Created default antigravity config at ~/.config/antigravity/config.json"
+          else
+            echo "Using existing antigravity config"
+          fi
+
+      # -----------------------------------------------------------------------
+      # 7) ⭐ تشغيل ttyd + agy داخل tmux في الخلفية
+      #
+      # المنطق: نشغّل tmux session يحتوي على agy، ثم نكشف الـ tmux عبر ttyd
+      # على المنفذ 7681. هذا يسمح للمستخدم بالتفاعل مع TUI الخاص بـ agy
+      # من المتصفح.
+      # -----------------------------------------------------------------------
+      - name: 🚀 Start Antigravity TUI inside tmux + ttyd (background)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          mkdir -p "$RUNNER_TEMP/antigravity-logs"
+          AGY_LOG="$RUNNER_TEMP/antigravity-logs/agy.log"
+          TTYD_LOG="$RUNNER_TEMP/antigravity-logs/ttyd.log"
+          : > "$AGY_LOG"; : > "$TTYD_LOG"
+
+          # نُنشئ tmux session اسمه "agy" يقوم بتشغيل agy في مجلد الـ repo
+          tmux new-session -d -s agy -x 220 -y 50 \
+            "cd '$GITHUB_WORKSPACE' && agy 2>&1 | tee -a '$AGY_LOG'"
+
+          # تأكيد أن الـ session حية
+          tmux has-session -t agy 2>/dev/null || { echo "❌ tmux session not created"; exit 1; }
+          echo "✅ tmux session 'agy' started"
+
+          # خيارات الـ credentials لحماية الصفحة (اختياري)
+          CRED_FLAG=""
+          if [ -n "${{ github.event.inputs.ttyd_credentials }}" ]; then
+            CRED_FLAG="--credential ${{ github.event.inputs.ttyd_credentials }}"
+            echo "🔐 ttyd protected with credentials"
+          fi
+
+          echo "Starting ttyd on 0.0.0.0:7681 ..."
+
+          # ⭐⭐ نفس نمط setsid + disown لمنع تعليق الخطوة ⭐⭐
+          # -W : السماح بالكتابة (write access) حتى يعمل الـ TUI تفاعلياً
+          # -p : المنفذ
+          # -i : binding interface
+          # tmux attach: نربط ttyd بـ tmux session اللي شغّلنا فيها agy
+          setsid bash -c "ttyd -p 7681 -i 0.0.0.0 -W $CRED_FLAG tmux attach -t agy </dev/null >>'$TTYD_LOG' 2>&1" &
+          TTYD_PID=$!
+          disown || true
+
+          echo "$TTYD_PID" > "$RUNNER_TEMP/ttyd.pid"
+          echo "ttyd PID = $TTYD_PID"
+
+          # ننتظر حتى يستجيب ttyd على المنفذ
+          UP=0
+          for i in $(seq 1 120); do
+            if (echo > /dev/tcp/127.0.0.1/7681) >/dev/null 2>&1; then
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:7681/ || echo "000")
+              if [ "$CODE" != "000" ]; then
+                UP=1; echo "✅ ttyd listening on :7681 (HTTP $CODE) after ${i}s"; break
+              fi
+            fi
+            if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+              echo "❌ ttyd process exited prematurely. Logs:"
+              cat "$TTYD_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$UP" -ne 1 ]; then
+            echo "❌ ttyd failed to become reachable in 120s. Logs:"
+            tail -n 200 "$TTYD_LOG" || true
+            kill -TERM "$TTYD_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "----- last 30 lines of ttyd log -----"
+          tail -n 30 "$TTYD_LOG" || true
+          echo "----- last 30 lines of agy log -----"
+          tail -n 30 "$AGY_LOG" || true
+
+      # -----------------------------------------------------------------------
+      # 8) فتح Cloudflare Quick Tunnel — نفس نمط الفصل الآمن
+      # -----------------------------------------------------------------------
+      - name: 🌐 Start Cloudflare Quick Tunnel
+        id: tunnel
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cloudflared-logs"
+          TUN_LOG="$RUNNER_TEMP/cloudflared-logs/tunnel.log"
+          : > "$TUN_LOG"
+
+          # نفس نمط setsid لضمان عدم تعليق الخطوة
+          setsid bash -c "cloudflared tunnel --no-autoupdate --url http://127.0.0.1:7681 </dev/null >>'$TUN_LOG' 2>&1" &
+          TUN_PID=$!
+          disown || true
+          echo "$TUN_PID" > "$RUNNER_TEMP/cloudflared.pid"
+          echo "cloudflared PID = $TUN_PID"
+
+          # استخراج الرابط https://*.trycloudflare.com من اللوج
+          PUBLIC_URL=""
+          for i in $(seq 1 90); do
+            if grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUN_LOG" | head -n1 > /tmp/url.txt 2>/dev/null; then
+              PUBLIC_URL=$(cat /tmp/url.txt || true)
+              if [ -n "$PUBLIC_URL" ]; then break; fi
+            fi
+            if ! kill -0 "$TUN_PID" 2>/dev/null; then
+              echo "❌ cloudflared exited prematurely. Logs:"
+              cat "$TUN_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ -z "$PUBLIC_URL" ]; then
+            echo "❌ Failed to get tunnel URL in 90s. Tunnel log:"
+            cat "$TUN_LOG"
+            exit 1
+          fi
+
+          echo "PUBLIC_URL=$PUBLIC_URL" >> "$GITHUB_ENV"
+          echo "public_url=$PUBLIC_URL" >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║         🎉 Antigravity CLI is LIVE on the Web 🎉              ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          printf  "║  URL:  %-55s ║\n" "$PUBLIC_URL"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      # -----------------------------------------------------------------------
+      # 9) استخراج رابط Google Sign-In من لوج agy (إن وجد)
+      # -----------------------------------------------------------------------
+      - name: 🔑 Extract Google Sign-In URL (if needed)
+        if: ${{ always() }}
+        run: |
+          AGY_LOG="$RUNNER_TEMP/antigravity-logs/agy.log"
+          SIGNIN_URL=""
+          for i in $(seq 1 30); do
+            if [ -f "$AGY_LOG" ]; then
+              SIGNIN_URL=$(grep -Eo 'https://[a-zA-Z0-9./?=_%&-]+(accounts\.google\.com|antigravity\.google)[a-zA-Z0-9./?=_%&-]*' "$AGY_LOG" | head -n1 || true)
+              if [ -n "$SIGNIN_URL" ]; then break; fi
+            fi
+            sleep 2
+          done
+
+          if [ -n "$SIGNIN_URL" ]; then
+            echo "SIGNIN_URL=$SIGNIN_URL" >> "$GITHUB_ENV"
+            echo "🔑 Google Sign-In URL: $SIGNIN_URL"
+          else
+            echo "ℹ️ لم يُكتشف رابط Sign-In في لوج agy حتى الآن — قد يظهر داخل الـ TUI نفسه عند فتح الرابط العام."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 10) كتابة الرابط في Summary
+      # -----------------------------------------------------------------------
+      - name: 📌 Publish URL to Job Summary
+        run: |
+          {
+            echo "# 🛸 Antigravity AI CLI — Live Session"
+            echo ""
+            echo "## 🌐 الرابط العام (Web TUI)"
+            echo ""
+            echo "### 👉 [${PUBLIC_URL}](${PUBLIC_URL})"
+            echo ""
+            if [ -n "${SIGNIN_URL:-}" ]; then
+              echo "## 🔑 رابط تسجيل الدخول إلى Google"
+              echo ""
+              echo "افتح هذا الرابط في متصفحك المحلي لإكمال المصادقة:"
+              echo ""
+              echo "\`\`\`"
+              echo "${SIGNIN_URL}"
+              echo "\`\`\`"
+              echo ""
+            fi
+            echo "| الحقل | القيمة |"
+            echo "|------|--------|"
+            echo "| **Repository** | \`${GITHUB_REPOSITORY}\` |"
+            echo "| **Branch** | \`${GITHUB_REF_NAME}\` |"
+            echo "| **مدة التشغيل** | ${{ github.event.inputs.duration_minutes }} دقيقة |"
+            echo "| **Auto commit** | ${{ github.event.inputs.auto_commit }} |"
+            echo "| **TUI Tool** | \`agy\` (Antigravity CLI) |"
+            echo "| **Web Wrapper** | \`ttyd + tmux\` |"
+            echo ""
+            echo "## ✏️ التعديلات"
+            echo "أي تعديل يقوم به \`agy\` على الملفات سيتم رفعه تلقائياً (commit + push)"
+            echo "إلى branch: \`${GITHUB_REF_NAME}\` كل ${{ github.event.inputs.commit_interval_seconds }} ثانية."
+            echo ""
+            echo "## 💡 نصائح استخدام"
+            echo "- التفاعل مع الـ agent من خلال خانة الإدخال أسفل صفحة TUI."
+            echo "- استخدم \`/help\` داخل الـ TUI لعرض كل الأوامر."
+            echo "- استخدم \`/logout\` لتسجيل الخروج من حساب Google."
+            echo ""
+            echo "## 🛑 لإيقاف الجلسة"
+            echo "اضغط على زر **Cancel workflow** في صفحة الـ Actions."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 11) Auto-commit loop في الخلفية — مع setsid
+      # -----------------------------------------------------------------------
+      - name: 🔁 Start auto-commit loop (background)
+        if: ${{ github.event.inputs.auto_commit == 'true' }}
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          git config --global user.email "antigravity-bot@users.noreply.github.com"
+          git config --global user.name  "antigravity-bot"
+
+          INTERVAL="${{ github.event.inputs.commit_interval_seconds }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          LOG="$RUNNER_TEMP/autocommit.log"
+          : > "$LOG"
+
+          cat > "$RUNNER_TEMP/autocommit.sh" <<EOF
+          #!/usr/bin/env bash
+          cd "$GITHUB_WORKSPACE"
+          while true; do
+            sleep $INTERVAL
+            if [ -n "\$(git status --porcelain)" ]; then
+              git add -A
+              MSG="🛸 antigravity: auto-commit \$(date -u +'%Y-%m-%d %H:%M:%SZ')"
+              git commit -m "\$MSG" >> "$LOG" 2>&1 || true
+              git push origin "$BRANCH" >> "$LOG" 2>&1 || true
+              echo "[\$(date -u)] pushed: \$MSG" >> "$LOG"
+            fi
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/autocommit.sh"
+
+          # ⭐ نفس نمط setsid + disown لمنع التعليق
+          setsid bash -c "bash '$RUNNER_TEMP/autocommit.sh' </dev/null >>'$LOG' 2>&1" &
+          AC_PID=$!
+          disown || true
+          echo "$AC_PID" > "$RUNNER_TEMP/autocommit.pid"
+          echo "✅ Auto-commit loop started (PID=$AC_PID, every ${INTERVAL}s) on branch ${BRANCH}"
+
+      # -----------------------------------------------------------------------
+      # 12) إبقاء الـ job حياً للمدة المطلوبة
+      # -----------------------------------------------------------------------
+      - name: ⏳ Keep session alive
+        run: |
+          DURATION_MIN="${{ github.event.inputs.duration_minutes }}"
+          DURATION_SEC=$(( DURATION_MIN * 60 ))
+          echo "Session will run for ${DURATION_MIN} minutes (${DURATION_SEC}s)."
+          echo "Public URL: ${PUBLIC_URL}"
+          echo ""
+
+          ELAPSED=0
+          STEP=300   # 5 minutes
+          while [ "$ELAPSED" -lt "$DURATION_SEC" ]; do
+            sleep "$STEP"
+            ELAPSED=$(( ELAPSED + STEP ))
+            REMAIN_MIN=$(( (DURATION_SEC - ELAPSED) / 60 ))
+            echo "⏱️ Heartbeat — elapsed=$((ELAPSED/60))min  remaining=${REMAIN_MIN}min"
+            echo "🌐 ${PUBLIC_URL}"
+
+            if [ -f "$RUNNER_TEMP/ttyd.pid" ] && ! kill -0 "$(cat $RUNNER_TEMP/ttyd.pid)" 2>/dev/null; then
+              echo "⚠️ ttyd process died — exiting."
+              exit 1
+            fi
+            if [ -f "$RUNNER_TEMP/cloudflared.pid" ] && ! kill -0 "$(cat $RUNNER_TEMP/cloudflared.pid)" 2>/dev/null; then
+              echo "⚠️ cloudflared process died — exiting."
+              exit 1
+            fi
+            # تحقق إضافي من tmux session
+            if ! tmux has-session -t agy 2>/dev/null; then
+              echo "⚠️ tmux 'agy' session ended — exiting."
+              exit 1
+            fi
+          done
+
+          echo "✅ Session duration reached. Shutting down."
+
+      # -----------------------------------------------------------------------
+      # 13) commit أخير
+      # -----------------------------------------------------------------------
+      - name: 💾 Final commit & push
+        if: ${{ always() && github.event.inputs.auto_commit == 'true' }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config --global user.email "antigravity-bot@users.noreply.github.com"
+          git config --global user.name  "antigravity-bot"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "🛸 antigravity: final auto-commit $(date -u +'%Y-%m-%d %H:%M:%SZ')" || true
+            git push origin "${GITHUB_REF_NAME}" || true
+          else
+            echo "No pending changes to commit."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 14) عرض اللوجات
+      # -----------------------------------------------------------------------
+      - name: 📜 Show logs (debug)
+        if: ${{ always() }}
+        run: |
+          echo "===== agy TUI log (tail 100) ====="
+          tail -n 100 "$RUNNER_TEMP/antigravity-logs/agy.log" 2>/dev/null || true
+          echo ""
+          echo "===== ttyd log (tail 60) ====="
+          tail -n 60  "$RUNNER_TEMP/antigravity-logs/ttyd.log" 2>/dev/null || true
+          echo ""
+          echo "===== cloudflared tunnel log (tail 60) ====="
+          tail -n 60  "$RUNNER_TEMP/cloudflared-logs/tunnel.log" 2>/dev/null || true
+          echo ""
+          echo "===== autocommit log (tail 60) ====="
+          tail -n 60  "$RUNNER_TEMP/autocommit.log" 2>/dev/null || true
+
+      # -----------------------------------------------------------------------
+      # 15) إغلاق نظيف
+      # -----------------------------------------------------------------------
+      - name: 🧹 Shutdown tmux & cloudflared
+        if: ${{ always() }}
+        run: |
+          tmux kill-session -t agy 2>/dev/null || true
+          if [ -f "$RUNNER_TEMP/ttyd.pid" ]; then
+            kill -TERM "$(cat $RUNNER_TEMP/ttyd.pid)" 2>/dev/null || true
+          fi
+          if [ -f "$RUNNER_TEMP/autocommit.pid" ]; then
+            kill -TERM "$(cat $RUNNER_TEMP/autocommit.pid)" 2>/dev/null || true
+          fi
+
+      - name: 🧹 Shutdown cloudflared (action)
+        if: ${{ always() }}
+        uses: AnimMouse/setup-cloudflared/shutdown@v2
