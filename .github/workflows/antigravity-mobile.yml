@@ -1,0 +1,711 @@
+name: 🛸 Antigravity AI Cloud (Mobile-Friendly Web UI)
+
+# نسخة مُحسّنة للهواتف Android:
+# - تضيف Web Wrapper مخصّص (HTML/JS) فوق ttyd يوفّر:
+#   Copy / Paste / Select All / Clear + شريط مفاتيح ناعم (Esc, Tab, Arrows, Ctrl+C, |, /, ~, -)
+#   + شريط prompt منفصل (تكتب بلوحة المفاتيح الأصلية ثم Send)
+#   + Long-press لنسخ النصوص، دعم Clipboard API الأصلي
+#   + PWA manifest لتثبيت الصفحة كتطبيق على الشاشة الرئيسية
+# - يبقى agy يعمل داخل tmux كما هو (لأنه TUI ولا توجد له واجهة رسومية أصلاً)
+# - nginx خفيف يقدم الـ wrapper ويعمل reverse-proxy لـ ttyd عبر WebSocket
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "كم دقيقة يبقى السيرفر شغّال (max 350)"
+        required: true
+        default: "350"
+        type: string
+      auto_commit:
+        description: "auto commit + push للتعديلات؟"
+        required: true
+        default: true
+        type: boolean
+      commit_interval_seconds:
+        description: "كل كم ثانية يتم فحص التغييرات"
+        required: true
+        default: "60"
+        type: string
+      ttyd_credentials:
+        description: "user:pass لحماية الصفحة (اتركها فارغة لتعطيل)"
+        required: false
+        default: ""
+        type: string
+      font_size:
+        description: "حجم الخط في الـ terminal على الهاتف (px)"
+        required: true
+        default: "16"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  antigravity-mobile:
+    name: 📱 Run Antigravity + Mobile Web Wrapper + Cloudflare Tunnel
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    env:
+      ANTIGRAVITY_API_KEY:          ${{ secrets.ANTIGRAVITY_API_KEY }}
+      GOOGLE_API_KEY:               ${{ secrets.GOOGLE_API_KEY }}
+      GEMINI_API_KEY:               ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_CLOUD_PROJECT:         ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
+      OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+      GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+      DEEPSEEK_API_KEY:    ${{ secrets.DEEPSEEK_API_KEY }}
+      MISTRAL_API_KEY:     ${{ secrets.MISTRAL_API_KEY }}
+      XAI_API_KEY:         ${{ secrets.XAI_API_KEY }}
+      COHERE_API_KEY:      ${{ secrets.COHERE_API_KEY }}
+      TOGETHER_API_KEY:    ${{ secrets.TOGETHER_API_KEY }}
+      PERPLEXITY_API_KEY:  ${{ secrets.PERPLEXITY_API_KEY }}
+      TERM: "xterm-256color"
+      COLORTERM: "truecolor"
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ⚙️ Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 🛠️ Install system dependencies (+ ttyd + nginx)
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            curl unzip jq git ca-certificates procps \
+            tmux gnome-keyring libsecret-1-0 dbus-x11 \
+            expect nginx
+
+          echo "::group::Installing ttyd binary"
+          TTYD_VER="1.7.7"
+          sudo curl -fsSL -o /usr/local/bin/ttyd \
+            "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.x86_64"
+          sudo chmod +x /usr/local/bin/ttyd
+          ttyd --version || true
+          echo "::endgroup::"
+
+      - name: 🛸 Install Google Antigravity CLI (official installer)
+        run: |
+          set -e
+          curl -fsSL https://antigravity.google/cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          which agy || true
+          agy --version || true
+
+      - name: ☁️ Install cloudflared
+        uses: AnimMouse/setup-cloudflared@v2
+
+      - name: ✅ Verify cloudflared
+        run: cloudflared --version
+
+      - name: 📝 Prepare Antigravity config
+        run: |
+          mkdir -p "$HOME/.config/antigravity"
+          if [ ! -f "$HOME/.config/antigravity/config.json" ] && [ ! -f ".antigravity/config.json" ]; then
+            cat > "$HOME/.config/antigravity/config.json" <<'JSON'
+          {
+            "theme": "dark",
+            "renderingMode": "alt-screen",
+            "telemetry": false,
+            "autoUpdate": false,
+            "workspaceTrust": "auto-trust"
+          }
+          JSON
+          fi
+
+      # =========================================================================
+      # 🎨 إنشاء الـ Mobile Web Wrapper (HTML + JS + PWA manifest)
+      # =========================================================================
+      - name: 🎨 Build Mobile Web Wrapper
+        run: |
+          set -e
+          FONT_SIZE="${{ github.event.inputs.font_size }}"
+          sudo mkdir -p /var/www/agy-mobile
+          sudo chown -R "$USER":"$USER" /var/www/agy-mobile
+
+          # ---------- index.html ----------
+          cat > /var/www/agy-mobile/index.html <<HTML
+          <!DOCTYPE html>
+          <html lang="ar" dir="rtl">
+          <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+          <meta name="theme-color" content="#0b0f17" />
+          <meta name="apple-mobile-web-app-capable" content="yes" />
+          <meta name="mobile-web-app-capable" content="yes" />
+          <link rel="manifest" href="/manifest.webmanifest" />
+          <title>🛸 Antigravity Mobile</title>
+          <style>
+            :root { --fs: ${FONT_SIZE}px; }
+            * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+            html, body { margin:0; padding:0; height:100%; background:#0b0f17; color:#e7eaf0;
+              font-family: -apple-system, "Segoe UI", Roboto, "Noto Sans Arabic", sans-serif;
+              overflow:hidden; overscroll-behavior:none; }
+            #app { display:flex; flex-direction:column; height:100dvh; }
+
+            /* ========== Top action bar ========== */
+            .topbar {
+              display:flex; gap:6px; padding:8px;
+              background:linear-gradient(180deg,#141a26,#0f1420);
+              border-bottom:1px solid #232a3a; overflow-x:auto; white-space:nowrap;
+              padding-top: calc(8px + env(safe-area-inset-top));
+            }
+            .btn {
+              flex:0 0 auto; min-width:62px; height:40px; padding:0 12px; border-radius:10px;
+              background:#1d2536; color:#e7eaf0; border:1px solid #2a3349;
+              font-size:14px; font-weight:600; display:inline-flex; align-items:center; justify-content:center;
+              cursor:pointer; user-select:none;
+            }
+            .btn:active { background:#2b3550; transform:scale(0.97); }
+            .btn.primary { background:#2d6cdf; border-color:#3a7af0; }
+            .btn.danger  { background:#a8324a; border-color:#cc3e5b; }
+            .btn.warn    { background:#a5761c; border-color:#c98a1f; }
+
+            /* ========== Terminal frame ========== */
+            #termWrap { flex:1; position:relative; background:#000; }
+            #termFrame { width:100%; height:100%; border:0; display:block; background:#000; }
+            #termFrame, #termWrap { font-size: var(--fs); }
+
+            /* ========== Quick keys row ========== */
+            .quickkeys {
+              display:flex; gap:5px; padding:6px; background:#0f1420;
+              border-top:1px solid #232a3a; overflow-x:auto; white-space:nowrap;
+            }
+            .kk {
+              flex:0 0 auto; min-width:46px; height:38px; padding:0 10px;
+              background:#1a2233; border:1px solid #2a3349; border-radius:8px;
+              color:#e7eaf0; font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+              font-size:14px; font-weight:700; display:inline-flex; align-items:center; justify-content:center;
+            }
+            .kk:active { background:#2b3550; }
+
+            /* ========== Prompt bar (bottom input) ========== */
+            .prompt {
+              display:flex; gap:6px; padding:8px;
+              background:#0f1420; border-top:1px solid #232a3a;
+              padding-bottom: calc(8px + env(safe-area-inset-bottom));
+            }
+            .prompt input {
+              flex:1; height:44px; padding:0 12px; border-radius:10px;
+              border:1px solid #2a3349; background:#1a2233; color:#fff;
+              font-size:16px; outline:none;
+            }
+            .prompt input:focus { border-color:#3a7af0; }
+            .prompt .send { width:64px; }
+
+            /* ========== Toast ========== */
+            #toast {
+              position:fixed; bottom:90px; left:50%; transform:translateX(-50%);
+              background:#1d2536; color:#fff; padding:10px 16px; border-radius:8px;
+              font-size:14px; opacity:0; transition:opacity .25s; pointer-events:none;
+              border:1px solid #3a7af0; z-index:9999;
+            }
+            #toast.show { opacity:1; }
+
+            /* Hide native scrollbar in horizontal rows */
+            .topbar::-webkit-scrollbar, .quickkeys::-webkit-scrollbar { display:none; }
+          </style>
+          </head>
+          <body>
+          <div id="app">
+
+            <div class="topbar" id="topbar">
+              <button class="btn primary" id="btnPaste">📋 Paste</button>
+              <button class="btn" id="btnCopy">📑 Copy</button>
+              <button class="btn" id="btnSelectAll">✳️ Select All</button>
+              <button class="btn warn" id="btnClear">🧹 Clear</button>
+              <button class="btn" id="btnFontUp">A+</button>
+              <button class="btn" id="btnFontDown">A−</button>
+              <button class="btn" id="btnReload">⟳</button>
+              <button class="btn" id="btnFull">⛶</button>
+            </div>
+
+            <div id="termWrap">
+              <iframe id="termFrame" src="/tty/" allow="clipboard-read; clipboard-write"></iframe>
+            </div>
+
+            <div class="quickkeys" id="quickkeys">
+              <button class="kk" data-send="\u001b">Esc</button>
+              <button class="kk" data-send="\t">Tab</button>
+              <button class="kk" data-send="\u001b[A">↑</button>
+              <button class="kk" data-send="\u001b[B">↓</button>
+              <button class="kk" data-send="\u001b[D">←</button>
+              <button class="kk" data-send="\u001b[C">→</button>
+              <button class="kk" data-send="\u0003">^C</button>
+              <button class="kk" data-send="\u0004">^D</button>
+              <button class="kk" data-send="\u001a">^Z</button>
+              <button class="kk" data-send="\u000c">^L</button>
+              <button class="kk" data-send="|">|</button>
+              <button class="kk" data-send="/">/</button>
+              <button class="kk" data-send="\\">\\</button>
+              <button class="kk" data-send="~">~</button>
+              <button class="kk" data-send="-">-</button>
+              <button class="kk" data-send="_">_</button>
+              <button class="kk" data-send="\$">\$</button>
+            </div>
+
+            <div class="prompt">
+              <input id="promptInput" type="text" placeholder="اكتب هنا ثم اضغط Send لإرسال للـ agy..." autocomplete="off" autocapitalize="off" spellcheck="false" />
+              <button class="btn primary send" id="btnSend">Send ⏎</button>
+            </div>
+          </div>
+
+          <div id="toast"></div>
+
+          <script>
+          (function(){
+            const frame = document.getElementById('termFrame');
+            const toastEl = document.getElementById('toast');
+            let rootFontSize = ${FONT_SIZE};
+
+            function toast(msg){
+              toastEl.textContent = msg;
+              toastEl.classList.add('show');
+              clearTimeout(toast._t);
+              toast._t = setTimeout(()=>toastEl.classList.remove('show'), 1600);
+            }
+
+            // ttyd v1.7+ يستقبل أوامر input عبر postMessage في الـ iframe
+            // أو يمكن الكتابة مباشرة عبر term.paste() لو الـ xterm.js متاح من نفس origin (nginx proxy → نفس origin ✅)
+            function getTerm(){
+              try {
+                const w = frame.contentWindow;
+                if (w && w.term && typeof w.term.paste === 'function') return w.term;
+              } catch(e){}
+              return null;
+            }
+            function sendInput(text){
+              const term = getTerm();
+              if (term && term._core && term._core._coreService) {
+                // xterm.js API
+                term._core._coreService.triggerDataEvent(text, true);
+                return true;
+              }
+              // fallback: محاولة paste
+              if (term && typeof term.paste === 'function') { term.paste(text); return true; }
+              return false;
+            }
+            function focusTerm(){
+              try { const t = getTerm(); if (t && typeof t.focus === 'function') t.focus(); } catch(e){}
+            }
+            function getSelection(){
+              const t = getTerm();
+              if (t && typeof t.getSelection === 'function') return t.getSelection() || '';
+              try { return frame.contentWindow.getSelection().toString() || ''; } catch(e){ return ''; }
+            }
+            function selectAll(){
+              const t = getTerm();
+              if (t && typeof t.selectAll === 'function') { t.selectAll(); return true; }
+              return false;
+            }
+            function clearScreen(){
+              const t = getTerm();
+              if (t && typeof t.clear === 'function') { t.clear(); return; }
+              sendInput('\u000c');
+            }
+
+            // ===== Buttons =====
+            document.getElementById('btnPaste').addEventListener('click', async ()=>{
+              try {
+                const txt = await navigator.clipboard.readText();
+                if (txt){ if (sendInput(txt)) toast('تم اللصق ✓'); else toast('فشل اللصق'); }
+                else toast('الحافظة فارغة');
+              } catch(e){ toast('اضغط مطولاً على الشاشة ثم Paste من المتصفح'); }
+              focusTerm();
+            });
+
+            document.getElementById('btnCopy').addEventListener('click', async ()=>{
+              const sel = getSelection();
+              if (!sel){ toast('حدد نصاً أولاً (اضغط مطولاً)'); return; }
+              try { await navigator.clipboard.writeText(sel); toast('تم النسخ ✓'); }
+              catch(e){ toast('فشل النسخ — الصلاحيات؟'); }
+            });
+
+            document.getElementById('btnSelectAll').addEventListener('click', ()=>{
+              if (selectAll()) toast('تم التحديد ✓'); else toast('غير مدعوم');
+            });
+
+            document.getElementById('btnClear').addEventListener('click', ()=>{
+              clearScreen(); toast('تم المسح');
+            });
+
+            document.getElementById('btnFontUp').addEventListener('click', ()=>{
+              rootFontSize = Math.min(rootFontSize + 1, 28);
+              document.documentElement.style.setProperty('--fs', rootFontSize+'px');
+              try { const t = getTerm(); if (t && t.options) { t.options.fontSize = rootFontSize; t.refresh && t.refresh(0, t.rows-1);} } catch(e){}
+              toast('Font: '+rootFontSize+'px');
+            });
+            document.getElementById('btnFontDown').addEventListener('click', ()=>{
+              rootFontSize = Math.max(rootFontSize - 1, 10);
+              document.documentElement.style.setProperty('--fs', rootFontSize+'px');
+              try { const t = getTerm(); if (t && t.options) { t.options.fontSize = rootFontSize; t.refresh && t.refresh(0, t.rows-1);} } catch(e){}
+              toast('Font: '+rootFontSize+'px');
+            });
+
+            document.getElementById('btnReload').addEventListener('click', ()=>{
+              frame.src = frame.src; toast('إعادة تحميل…');
+            });
+
+            document.getElementById('btnFull').addEventListener('click', ()=>{
+              const el = document.documentElement;
+              if (!document.fullscreenElement && el.requestFullscreen) el.requestFullscreen();
+              else if (document.exitFullscreen) document.exitFullscreen();
+            });
+
+            // ===== Quick keys =====
+            document.querySelectorAll('.kk').forEach(b=>{
+              b.addEventListener('click', ()=>{
+                const s = b.getAttribute('data-send');
+                const decoded = s.replace(/\\\\u([0-9a-fA-F]{4})/g, (m,h)=>String.fromCharCode(parseInt(h,16)));
+                if (!sendInput(decoded)) toast('Terminal غير جاهز');
+                focusTerm();
+              });
+            });
+
+            // ===== Prompt bar =====
+            const input = document.getElementById('promptInput');
+            function sendPrompt(addEnter){
+              const v = input.value;
+              if (!v && !addEnter) return;
+              const ok = sendInput(v + (addEnter ? '\n' : ''));
+              if (ok){ input.value=''; }
+              else toast('Terminal غير جاهز بعد');
+            }
+            document.getElementById('btnSend').addEventListener('click', ()=> sendPrompt(true));
+            input.addEventListener('keydown', e=>{
+              if (e.key === 'Enter'){ e.preventDefault(); sendPrompt(true); }
+            });
+
+            // PWA
+            if ('serviceWorker' in navigator) {
+              navigator.serviceWorker.register('/sw.js').catch(()=>{});
+            }
+          })();
+          </script>
+          </body>
+          </html>
+          HTML
+
+          # ---------- manifest.webmanifest ----------
+          cat > /var/www/agy-mobile/manifest.webmanifest <<'JSON'
+          {
+            "name": "Antigravity Mobile",
+            "short_name": "Antigravity",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "any",
+            "background_color": "#0b0f17",
+            "theme_color": "#0b0f17",
+            "icons": [
+              { "src": "/icon-192.png", "sizes":"192x192", "type":"image/png" },
+              { "src": "/icon-512.png", "sizes":"512x512", "type":"image/png" }
+            ]
+          }
+          JSON
+
+          # ---------- sw.js (minimal) ----------
+          cat > /var/www/agy-mobile/sw.js <<'JS'
+          self.addEventListener('install', e => self.skipWaiting());
+          self.addEventListener('activate', e => self.clients.claim());
+          self.addEventListener('fetch', e => {});
+          JS
+
+          # ---------- icons (1x1 placeholder, browsers will accept) ----------
+          # PNG صغير شفاف؛ يمكن استبداله لاحقاً
+          base64 -d > /var/www/agy-mobile/icon-192.png <<B64
+          iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=
+          B64
+          cp /var/www/agy-mobile/icon-192.png /var/www/agy-mobile/icon-512.png
+
+          ls -lh /var/www/agy-mobile/
+
+      # =========================================================================
+      # 🌐 nginx: يقدّم الـ wrapper على /، ويعمل reverse-proxy WebSocket لـ ttyd على /tty/
+      # =========================================================================
+      - name: 🌐 Configure nginx reverse proxy
+        run: |
+          set -e
+          sudo tee /etc/nginx/sites-available/agy-mobile > /dev/null <<'NGINX'
+          server {
+            listen 8080 default_server;
+            listen [::]:8080 default_server;
+            server_name _;
+            root /var/www/agy-mobile;
+            index index.html;
+
+            # Security: lightweight
+            add_header X-Content-Type-Options nosniff;
+            add_header Referrer-Policy no-referrer;
+            add_header Permissions-Policy "clipboard-read=(self), clipboard-write=(self)";
+
+            location = / { try_files /index.html =404; }
+
+            # ttyd reverse proxy with WebSocket
+            location /tty/ {
+              proxy_pass http://127.0.0.1:7681/;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "Upgrade";
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_read_timeout  3600s;
+              proxy_send_timeout  3600s;
+              proxy_buffering off;
+            }
+
+            location / { try_files $uri $uri/ /index.html; }
+          }
+          NGINX
+
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo ln -sf /etc/nginx/sites-available/agy-mobile /etc/nginx/sites-enabled/agy-mobile
+          sudo nginx -t
+          sudo systemctl restart nginx || sudo service nginx restart
+          echo "✅ nginx serving on :8080 (UI) → /tty/ → ttyd:7681"
+
+      # =========================================================================
+      # 🚀 تشغيل agy داخل tmux + ttyd (نفس منطق الإصدار السابق)
+      # =========================================================================
+      - name: 🚀 Start Antigravity TUI inside tmux + ttyd (background)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          mkdir -p "$RUNNER_TEMP/antigravity-logs"
+          AGY_LOG="$RUNNER_TEMP/antigravity-logs/agy.log"
+          TTYD_LOG="$RUNNER_TEMP/antigravity-logs/ttyd.log"
+          : > "$AGY_LOG"; : > "$TTYD_LOG"
+
+          tmux new-session -d -s agy -x 220 -y 50 \
+            "cd '$GITHUB_WORKSPACE' && \
+             echo '═══════════════════════════════════════════════════════' && \
+             echo '🛸 Starting Antigravity CLI (agy)...' && \
+             echo '═══════════════════════════════════════════════════════' && \
+             agy ; \
+             EXIT_CODE=\$?; \
+             echo ''; \
+             echo \"⚠️  agy exited with code \$EXIT_CODE\"; \
+             echo 'Fallback shell. Run: agy'; \
+             exec bash"
+
+          tmux has-session -t agy 2>/dev/null || { echo "❌ tmux session not created"; exit 1; }
+          tmux pipe-pane -t agy -o "cat >> '$AGY_LOG'"
+          sleep 5
+          echo "----- tmux pane snapshot after 5s -----"
+          tmux capture-pane -t agy -p | head -n 40 || true
+
+          CRED_FLAG=""
+          if [ -n "${{ github.event.inputs.ttyd_credentials }}" ]; then
+            CRED_FLAG="--credential ${{ github.event.inputs.ttyd_credentials }}"
+            echo "🔐 ttyd protected with credentials"
+          fi
+
+          # ⭐ ttyd يستمع على 127.0.0.1 فقط — nginx يفعل الـ proxy للخارج
+          # -W = writable، -t = خيارات xterm (font size, dynamic resize)
+          setsid bash -c "ttyd -p 7681 -i 127.0.0.1 -W \
+            -t 'fontSize=${{ github.event.inputs.font_size }}' \
+            -t 'rendererType=canvas' \
+            -t 'cursorBlink=true' \
+            -t 'cursorStyle=block' \
+            -t 'scrollback=10000' \
+            -t 'disableLeaveAlert=true' \
+            -t 'disableResizeOverlay=true' \
+            $CRED_FLAG tmux attach -t agy </dev/null >>'$TTYD_LOG' 2>&1" &
+          TTYD_PID=$!
+          disown || true
+          echo "$TTYD_PID" > "$RUNNER_TEMP/ttyd.pid"
+
+          UP=0
+          for i in $(seq 1 120); do
+            if (echo > /dev/tcp/127.0.0.1/7681) >/dev/null 2>&1; then
+              UP=1; echo "✅ ttyd listening on 127.0.0.1:7681 after ${i}s"; break
+            fi
+            if ! kill -0 "$TTYD_PID" 2>/dev/null; then
+              echo "❌ ttyd died:"; cat "$TTYD_LOG" || true; exit 1
+            fi
+            sleep 1
+          done
+          [ "$UP" -eq 1 ] || { echo "❌ ttyd not reachable"; tail -n 200 "$TTYD_LOG"; exit 1; }
+
+          # تحقق من nginx → wrapper
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ || echo "000")
+          echo "nginx /  →  HTTP $CODE"
+          CODE2=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/tty/ || echo "000")
+          echo "nginx /tty/  →  HTTP $CODE2"
+
+      - name: 🌐 Start Cloudflare Quick Tunnel (points to nginx :8080)
+        id: tunnel
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cloudflared-logs"
+          TUN_LOG="$RUNNER_TEMP/cloudflared-logs/tunnel.log"
+          : > "$TUN_LOG"
+
+          # ⭐ نوجّه التونل إلى nginx (8080) وليس مباشرة إلى ttyd
+          setsid bash -c "cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8080 </dev/null >>'$TUN_LOG' 2>&1" &
+          TUN_PID=$!
+          disown || true
+          echo "$TUN_PID" > "$RUNNER_TEMP/cloudflared.pid"
+
+          PUBLIC_URL=""
+          for i in $(seq 1 90); do
+            if grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUN_LOG" | head -n1 > /tmp/url.txt 2>/dev/null; then
+              PUBLIC_URL=$(cat /tmp/url.txt || true)
+              [ -n "$PUBLIC_URL" ] && break
+            fi
+            if ! kill -0 "$TUN_PID" 2>/dev/null; then
+              echo "❌ cloudflared exited"; cat "$TUN_LOG"; exit 1
+            fi
+            sleep 1
+          done
+          [ -n "$PUBLIC_URL" ] || { echo "❌ no tunnel URL"; cat "$TUN_LOG"; exit 1; }
+
+          echo "PUBLIC_URL=$PUBLIC_URL" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║   📱  Antigravity Mobile UI is LIVE                            ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          printf  "║  URL:  %-55s ║\n" "$PUBLIC_URL"
+          echo "║  افتح الرابط في Chrome على Android ثم Menu → Install App      ║"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+
+      - name: 🔑 Extract Google Sign-In URL (if needed)
+        if: ${{ always() }}
+        run: |
+          AGY_LOG="$RUNNER_TEMP/antigravity-logs/agy.log"
+          SIGNIN_URL=""
+          for i in $(seq 1 30); do
+            [ -f "$AGY_LOG" ] && SIGNIN_URL=$(grep -Eo 'https://[a-zA-Z0-9./?=_%&-]+(accounts\.google\.com|antigravity\.google)[a-zA-Z0-9./?=_%&-]*' "$AGY_LOG" | head -n1 || true)
+            [ -n "$SIGNIN_URL" ] && break
+            SIGNIN_URL=$(tmux capture-pane -t agy -p 2>/dev/null | grep -Eo 'https://[a-zA-Z0-9./?=_%&-]+(accounts\.google\.com|antigravity\.google)[a-zA-Z0-9./?=_%&-]*' | head -n1 || true)
+            [ -n "$SIGNIN_URL" ] && break
+            sleep 2
+          done
+          if [ -n "$SIGNIN_URL" ]; then
+            echo "SIGNIN_URL=$SIGNIN_URL" >> "$GITHUB_ENV"
+            echo "🔑 Google Sign-In URL: $SIGNIN_URL"
+          fi
+
+      - name: 📌 Publish URL to Job Summary
+        run: |
+          {
+            echo "# 🛸 Antigravity — Mobile UI"
+            echo ""
+            echo "## 📱 افتح هذا الرابط على هاتفك"
+            echo ""
+            echo "### 👉 [${PUBLIC_URL}](${PUBLIC_URL})"
+            echo ""
+            echo "**نصيحة:** في Chrome على Android، افتح القائمة (⋮) → **Install app** لإضافته كأيقونة على الشاشة الرئيسية يعمل كتطبيق."
+            echo ""
+            echo "### ميزات الواجهة:"
+            echo "- 📋 أزرار **Paste / Copy / Select All / Clear** كبيرة في الأعلى"
+            echo "- ⌨️ شريط مفاتيح ناعم: \`Esc\`, \`Tab\`, الأسهم، \`Ctrl+C/D/Z/L\`, رموز \`| / \\ ~ - _ \$\`"
+            echo "- 💬 شريط prompt في الأسفل: اكتب بلوحة المفاتيح العادية ثم اضغط **Send**"
+            echo "- 🔍 تكبير/تصغير الخط فوراً (A+ / A−)"
+            echo "- ⛶ Fullscreen + PWA Installable"
+            echo ""
+            if [ -n "${SIGNIN_URL:-}" ]; then
+              echo "## 🔑 Google Sign-In"
+              echo "\`\`\`"
+              echo "${SIGNIN_URL}"
+              echo "\`\`\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 🔁 Start auto-commit loop (background)
+        if: ${{ github.event.inputs.auto_commit == 'true' }}
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          git config --global user.email "antigravity-bot@users.noreply.github.com"
+          git config --global user.name  "antigravity-bot"
+          INTERVAL="${{ github.event.inputs.commit_interval_seconds }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          LOG="$RUNNER_TEMP/autocommit.log"
+          : > "$LOG"
+          cat > "$RUNNER_TEMP/autocommit.sh" <<EOF
+          #!/usr/bin/env bash
+          cd "$GITHUB_WORKSPACE"
+          while true; do
+            sleep $INTERVAL
+            if [ -n "\$(git status --porcelain)" ]; then
+              git add -A
+              MSG="🛸 antigravity: auto-commit \$(date -u +'%Y-%m-%d %H:%M:%SZ')"
+              git commit -m "\$MSG" >> "$LOG" 2>&1 || true
+              git push origin "$BRANCH" >> "$LOG" 2>&1 || true
+            fi
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/autocommit.sh"
+          setsid bash -c "bash '$RUNNER_TEMP/autocommit.sh' </dev/null >>'$LOG' 2>&1" &
+          echo $! > "$RUNNER_TEMP/autocommit.pid"
+
+      - name: ⏳ Keep session alive
+        run: |
+          DURATION_MIN="${{ github.event.inputs.duration_minutes }}"
+          DURATION_SEC=$(( DURATION_MIN * 60 ))
+          ELAPSED=0; STEP=300
+          while [ "$ELAPSED" -lt "$DURATION_SEC" ]; do
+            sleep "$STEP"
+            ELAPSED=$(( ELAPSED + STEP ))
+            REMAIN=$(( (DURATION_SEC - ELAPSED) / 60 ))
+            echo "⏱️ elapsed=$((ELAPSED/60))min  remaining=${REMAIN}min  url=${PUBLIC_URL}"
+            if [ -f "$RUNNER_TEMP/ttyd.pid" ] && ! kill -0 "$(cat $RUNNER_TEMP/ttyd.pid)" 2>/dev/null; then
+              echo "⚠️ ttyd died"; exit 1
+            fi
+            if [ -f "$RUNNER_TEMP/cloudflared.pid" ] && ! kill -0 "$(cat $RUNNER_TEMP/cloudflared.pid)" 2>/dev/null; then
+              echo "⚠️ cloudflared died"; exit 1
+            fi
+          done
+
+      - name: 💾 Final commit & push
+        if: ${{ always() && github.event.inputs.auto_commit == 'true' }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config --global user.email "antigravity-bot@users.noreply.github.com"
+          git config --global user.name  "antigravity-bot"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "🛸 antigravity: final auto-commit $(date -u +'%Y-%m-%d %H:%M:%SZ')" || true
+            git push origin "${GITHUB_REF_NAME}" || true
+          fi
+
+      - name: 📜 Show logs (debug)
+        if: ${{ always() }}
+        run: |
+          echo "===== agy log (tail 200) ====="
+          tail -n 200 "$RUNNER_TEMP/antigravity-logs/agy.log" 2>/dev/null || true
+          echo "===== ttyd log (tail 60) ====="
+          tail -n 60  "$RUNNER_TEMP/antigravity-logs/ttyd.log" 2>/dev/null || true
+          echo "===== nginx error log ====="
+          sudo tail -n 60 /var/log/nginx/error.log 2>/dev/null || true
+          echo "===== cloudflared log (tail 60) ====="
+          tail -n 60 "$RUNNER_TEMP/cloudflared-logs/tunnel.log" 2>/dev/null || true
+
+      - name: 🧹 Shutdown
+        if: ${{ always() }}
+        run: |
+          tmux kill-session -t agy 2>/dev/null || true
+          [ -f "$RUNNER_TEMP/ttyd.pid" ] && kill -TERM "$(cat $RUNNER_TEMP/ttyd.pid)" 2>/dev/null || true
+          [ -f "$RUNNER_TEMP/autocommit.pid" ] && kill -TERM "$(cat $RUNNER_TEMP/autocommit.pid)" 2>/dev/null || true
+          sudo systemctl stop nginx 2>/dev/null || sudo service nginx stop 2>/dev/null || true
+
+      - name: 🧹 Shutdown cloudflared
+        if: ${{ always() }}
+        uses: AnimMouse/setup-cloudflared/shutdown@v2
