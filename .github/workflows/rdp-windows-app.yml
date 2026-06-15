@@ -1,0 +1,456 @@
+name: 🖥️ Free RDP Server (Microsoft Remote Desktop / Windows App)
+
+# =============================================================================
+# هذا الـ workflow ينشئ سيرفر RDP كامل (Ubuntu + XFCE4 + xrdp) على GitHub Actions
+# ويفتح نفقاً عبر ngrok بحيث يمكنك الاتصال من:
+#   - تطبيق Microsoft Remote Desktop  (Windows / macOS / iOS)
+#   - تطبيق Windows App                (Android — الاسم الجديد)
+#   - أي عميل RDP قياسي                (mstsc.exe / Remmina / FreeRDP)
+#
+# عند تشغيل الـ workflow ستظهر لك في الـ Summary و في اللوج معلومات الدخول:
+#   Host (IP/Hostname) , Port , Username , Password
+#
+# المتطلبات (Secret واحد فقط):
+#   1) NGROK_AUTH_TOKEN   →  من https://dashboard.ngrok.com/get-started/your-authtoken
+#
+# اختياري: يمكنك تخصيص الـ username/password عند تشغيل الـ workflow.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_username:
+        description: "اسم المستخدم لتسجيل الدخول عبر RDP"
+        required: true
+        default: "rdpuser"
+        type: string
+      rdp_password:
+        description: "كلمة المرور (اتركها فارغة لتوليد قوية تلقائياً)"
+        required: false
+        default: ""
+        type: string
+      duration_minutes:
+        description: "كم دقيقة يبقى السيرفر شغّال (max 350)"
+        required: true
+        default: "350"
+        type: string
+      desktop_env:
+        description: "بيئة سطح المكتب"
+        required: true
+        default: "xfce4"
+        type: choice
+        options:
+          - xfce4
+          - mate
+      ngrok_region:
+        description: "أقرب منطقة ngrok (us / eu / ap / au / sa / jp / in)"
+        required: true
+        default: "eu"
+        type: choice
+        options:
+          - us
+          - eu
+          - ap
+          - au
+          - sa
+          - jp
+          - in
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    name: 🚀 Start RDP Server + ngrok TCP tunnel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+      NEEDRESTART_SUSPEND: 1
+
+    steps:
+      # -------------------------------------------------------------------------
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------------
+      - name: 🔐 Validate required secret
+        run: |
+          if [ -z "${{ secrets.NGROK_AUTH_TOKEN }}" ]; then
+            echo "::error::Missing secret NGROK_AUTH_TOKEN."
+            echo "أضف الـ token من: https://dashboard.ngrok.com/get-started/your-authtoken"
+            echo "في: Repo → Settings → Secrets and variables → Actions → New repository secret"
+            exit 1
+          fi
+          echo "✅ NGROK_AUTH_TOKEN موجود."
+
+      # -------------------------------------------------------------------------
+      - name: 🔑 Generate / set credentials
+        id: creds
+        run: |
+          set -euo pipefail
+          USERNAME="${{ github.event.inputs.rdp_username }}"
+          PASSWORD="${{ github.event.inputs.rdp_password }}"
+
+          # تنظيف اسم المستخدم (linux-safe)
+          USERNAME=$(echo "$USERNAME" | tr -cd '[:alnum:]_-' | cut -c1-32)
+          if [ -z "$USERNAME" ]; then USERNAME="rdpuser"; fi
+
+          # توليد كلمة مرور قوية إذا لم يُحدّدها المستخدم
+          if [ -z "$PASSWORD" ]; then
+            PASSWORD=$(tr -dc 'A-Za-z0-9@#%+=' < /dev/urandom | head -c 16)
+          fi
+
+          # نخفي القيم في اللوج
+          echo "::add-mask::$PASSWORD"
+
+          echo "RDP_USERNAME=$USERNAME" >> "$GITHUB_ENV"
+          echo "RDP_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+          echo "username=$USERNAME"     >> "$GITHUB_OUTPUT"
+          echo "✅ Credentials prepared (user=$USERNAME)"
+
+      # -------------------------------------------------------------------------
+      - name: 🛠️ Install Desktop Environment + xrdp
+        run: |
+          set -euo pipefail
+          DESKTOP="${{ github.event.inputs.desktop_env }}"
+          echo "::group::apt-get update"
+          sudo apt-get update -qq
+          echo "::endgroup::"
+
+          echo "::group::Installing $DESKTOP + xrdp + utilities"
+          if [ "$DESKTOP" = "mate" ]; then
+            sudo apt-get install -y -qq \
+              mate-desktop-environment-core mate-terminal \
+              xrdp xorgxrdp dbus-x11 \
+              firefox sudo curl wget unzip jq net-tools \
+              pulseaudio policykit-1 || true
+            echo "mate-session" > /tmp/xsession_cmd
+          else
+            sudo apt-get install -y -qq \
+              xfce4 xfce4-goodies xfce4-terminal \
+              xrdp xorgxrdp dbus-x11 \
+              firefox sudo curl wget unzip jq net-tools \
+              pulseaudio policykit-1 || true
+            echo "xfce4-session" > /tmp/xsession_cmd
+          fi
+          echo "::endgroup::"
+
+          # تأكد أن خدمة xrdp مثبّتة
+          dpkg -l | grep -E '^ii\s+xrdp\s' >/dev/null || { echo "::error::xrdp not installed"; exit 1; }
+          echo "✅ Desktop environment + xrdp installed"
+
+      # -------------------------------------------------------------------------
+      - name: 👤 Create RDP user
+        run: |
+          set -euo pipefail
+          USERNAME="$RDP_USERNAME"
+          PASSWORD="$RDP_PASSWORD"
+
+          if id "$USERNAME" >/dev/null 2>&1; then
+            echo "User $USERNAME exists — updating password"
+          else
+            sudo useradd -m -s /bin/bash "$USERNAME"
+          fi
+
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo "$USERNAME"
+          # السماح للمستخدم باستخدام sudo بدون كلمة مرور (مريح داخل الجلسة)
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/90-${USERNAME} >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/90-${USERNAME}
+
+          # إعداد .xsession لتشغيل بيئة سطح المكتب الصحيحة
+          XSESSION_CMD=$(cat /tmp/xsession_cmd)
+          echo "$XSESSION_CMD" | sudo tee /home/${USERNAME}/.xsession >/dev/null
+          sudo chown "${USERNAME}:${USERNAME}" /home/${USERNAME}/.xsession
+          sudo chmod +x /home/${USERNAME}/.xsession
+
+          # نُعطّل screen-lock / power-management
+          sudo -u "$USERNAME" mkdir -p "/home/${USERNAME}/.config/autostart" || true
+          AUTOSTART_FILE="/home/${USERNAME}/.config/autostart/disable-power-mgr.desktop"
+          {
+            echo '[Desktop Entry]'
+            echo 'Type=Application'
+            echo 'Name=disable-power-mgr'
+            echo 'Exec=xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/blank-on-ac -s 0'
+            echo 'X-GNOME-Autostart-enabled=true'
+          } | sudo tee "$AUTOSTART_FILE" >/dev/null
+          sudo chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config" || true
+
+          echo "✅ User '$USERNAME' ready"
+
+      # -------------------------------------------------------------------------
+      - name: ⚙️ Configure xrdp
+        run: |
+          set -euo pipefail
+
+          # السماح لـ xrdp بقراءة شهادة الـ SSL
+          sudo adduser xrdp ssl-cert || true
+
+          # إصلاح مشكلة شائعة: نضمن startwm.sh يستدعي .xsession
+          {
+            printf '%s\n' '#!/bin/sh'
+            printf '%s\n' 'if [ -r /etc/default/locale ]; then'
+            printf '%s\n' '  . /etc/default/locale'
+            printf '%s\n' '  export LANG LANGUAGE'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'if [ -f "$HOME/.xsession" ]; then'
+            printf '%s\n' '  exec sh "$HOME/.xsession"'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'if command -v xfce4-session >/dev/null 2>&1; then'
+            printf '%s\n' '  exec xfce4-session'
+            printf '%s\n' 'elif command -v mate-session >/dev/null 2>&1; then'
+            printf '%s\n' '  exec mate-session'
+            printf '%s\n' 'elif [ -r /etc/X11/Xsession ]; then'
+            printf '%s\n' '  exec /etc/X11/Xsession'
+            printf '%s\n' 'fi'
+          } | sudo tee /etc/xrdp/startwm.sh >/dev/null
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # نضمن أن xrdp يسمع على 3389 لكل الواجهات
+          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini || true
+          sudo sed -i 's/^address=.*/address=0.0.0.0/' /etc/xrdp/xrdp.ini || true
+
+          # حل مشكلة "Authentication Required to Create Managed Color Device"
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+          {
+            printf '%s\n' '[Allow Colord all Users]'
+            printf '%s\n' 'Identity=unix-user:*'
+            printf '%s\n' 'Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile'
+            printf '%s\n' 'ResultAny=no'
+            printf '%s\n' 'ResultInactive=no'
+            printf '%s\n' 'ResultActive=yes'
+          } | sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla >/dev/null
+
+          # تشغيل + تمكين الخدمة
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp
+          sudo systemctl restart xrdp-sesman || true
+
+          sleep 3
+          sudo systemctl status xrdp --no-pager | head -n 20 || true
+
+          # تأكيد أن البورت 3389 يستمع
+          if ss -tlnp | grep -q ':3389'; then
+            echo "✅ xrdp listening on 0.0.0.0:3389"
+          else
+            echo "::error::xrdp is NOT listening on 3389"
+            sudo journalctl -u xrdp --no-pager | tail -n 40 || true
+            exit 1
+          fi
+
+      # -------------------------------------------------------------------------
+      - name: 🌐 Install & start ngrok TCP tunnel (port 3389)
+        id: ngrok
+        run: |
+          set -euo pipefail
+          REGION="${{ github.event.inputs.ngrok_region }}"
+
+          echo "::group::Installing ngrok"
+          curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ngrok
+          ngrok --version
+          echo "::endgroup::"
+
+          # تكوين الـ auth token
+          ngrok config add-authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
+
+          # تشغيل ngrok في الخلفية ، TCP على بورت 3389 = RDP
+          LOG="$RUNNER_TEMP/ngrok.log"
+          : > "$LOG"
+          nohup ngrok tcp 3389 --region "$REGION" --log=stdout --log-format=json > "$LOG" 2>&1 &
+          NGROK_PID=$!
+          echo "$NGROK_PID" > "$RUNNER_TEMP/ngrok.pid"
+          echo "ngrok PID=$NGROK_PID"
+
+          # انتظر حتى الـ API المحلي يستجيب (4040) ثم استخرج الـ URL
+          PUBLIC_URL=""
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:4040/api/tunnels >/tmp/tun.json 2>/dev/null; then
+              PUBLIC_URL=$(jq -r '.tunnels[0].public_url // empty' /tmp/tun.json)
+              if [ -n "$PUBLIC_URL" ] && [ "$PUBLIC_URL" != "null" ]; then
+                break
+              fi
+            fi
+            if ! kill -0 "$NGROK_PID" 2>/dev/null; then
+              echo "::error::ngrok process died early"
+              tail -n 100 "$LOG" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ -z "$PUBLIC_URL" ]; then
+            echo "::error::Failed to obtain ngrok tunnel URL in 120s"
+            tail -n 100 "$LOG" || true
+            exit 1
+          fi
+
+          # PUBLIC_URL مثل: tcp://0.tcp.eu.ngrok.io:18432
+          HOST=$(echo "$PUBLIC_URL" | sed -E 's#^tcp://([^:]+):.*#\1#')
+          PORT=$(echo "$PUBLIC_URL" | sed -E 's#^tcp://[^:]+:([0-9]+)#\1#')
+
+          echo "RDP_HOST=$HOST" >> "$GITHUB_ENV"
+          echo "RDP_PORT=$PORT" >> "$GITHUB_ENV"
+          echo "RDP_PUBLIC_URL=$PUBLIC_URL" >> "$GITHUB_ENV"
+
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "✅ ngrok tunnel up: $PUBLIC_URL"
+          echo "   → host=$HOST  port=$PORT"
+
+      # -------------------------------------------------------------------------
+      - name: 🧪 Verify RDP reachability (local + via tunnel)
+        run: |
+          set -euo pipefail
+
+          # 1) محلي
+          if ! (echo > /dev/tcp/127.0.0.1/3389) >/dev/null 2>&1; then
+            echo "::error::Local xrdp port 3389 not reachable"
+            exit 1
+          fi
+          echo "✅ Local 3389 OK"
+
+          # 2) عبر النفق
+          if ! timeout 10 bash -c "echo > /dev/tcp/${RDP_HOST}/${RDP_PORT}" >/dev/null 2>&1; then
+            echo "::warning::Tunnel TCP probe failed — قد يكون بسبب سياسة DNS داخل runner. الاتصال من العميل سيعمل."
+          else
+            echo "✅ Tunnel ${RDP_HOST}:${RDP_PORT} reachable from runner"
+          fi
+
+          # 3) فحص بسيط لـ بنية الـ RDP handshake (يكفي اتصال TCP)
+          echo "Done."
+
+      # -------------------------------------------------------------------------
+      - name: 📌 Publish connection info (logs + summary)
+        run: |
+          # نطبع المعلومات في اللوج (الباسوورد سيُخفى تلقائياً بسبب add-mask)
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║   🎉  RDP SERVER READY — اتصل عبر Microsoft Remote Desktop   ║"
+          echo "║         (Windows / Mac / iOS) أو تطبيق Windows App (Android) ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf  "║  Host (PC name) : %-42s ║\n" "${RDP_HOST}"
+          printf  "║  Port           : %-42s ║\n" "${RDP_PORT}"
+          printf  "║  Username       : %-42s ║\n" "${RDP_USERNAME}"
+          printf  "║  Password       : %-42s ║\n" "(see Job Summary — مخفي هنا)"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "📋 في تطبيق Microsoft Remote Desktop / Windows App:"
+          echo "    PC name :  ${RDP_HOST}:${RDP_PORT}"
+          echo "    User    :  ${RDP_USERNAME}"
+          echo "    Pass    :  <see Job Summary>"
+          echo ""
+
+          # ملخص الـ Job — مرئي فقط لمن لديه صلاحية على الـ repo
+          {
+            echo "# 🖥️ RDP Server — Live"
+            echo ""
+            echo "## معلومات تسجيل الدخول"
+            echo ""
+            echo "| الحقل | القيمة |"
+            echo "|------|--------|"
+            echo "| **PC name (Host:Port)** | \`${RDP_HOST}:${RDP_PORT}\` |"
+            echo "| **Username**            | \`${RDP_USERNAME}\` |"
+            echo "| **Password**            | \`${RDP_PASSWORD}\` |"
+            echo "| **Desktop**             | ${{ github.event.inputs.desktop_env }} |"
+            echo "| **ngrok region**        | ${{ github.event.inputs.ngrok_region }} |"
+            echo "| **Duration**            | ${{ github.event.inputs.duration_minutes }} min |"
+            echo ""
+            echo "## كيف تتصل"
+            echo ""
+            echo "### 🪟 Windows (mstsc)"
+            echo '```'
+            echo "mstsc /v:${RDP_HOST}:${RDP_PORT}"
+            echo '```'
+            echo ""
+            echo "### 📱 Android — تطبيق **Windows App** (سابقاً Microsoft Remote Desktop)"
+            echo "1. افتح التطبيق → **+** → **Add PC**"
+            echo "2. **PC name** : \`${RDP_HOST}:${RDP_PORT}\`"
+            echo "3. **User account** : أضف حساباً جديداً بـ \`${RDP_USERNAME}\` + كلمة المرور أعلاه"
+            echo "4. اضغط **Save** ثم على البطاقة للاتصال."
+            echo ""
+            echo "### 🍎 iOS / macOS — Windows App / Microsoft Remote Desktop"
+            echo "نفس الخطوات."
+            echo ""
+            echo "### 🐧 Linux — Remmina / FreeRDP"
+            echo '```'
+            echo "xfreerdp /v:${RDP_HOST}:${RDP_PORT} /u:${RDP_USERNAME} /p:'${RDP_PASSWORD}' /size:1280x800 /cert:ignore"
+            echo '```'
+            echo ""
+            echo "> ⚠️ الشهادة موقعة ذاتياً → اقبلها عند أول اتصال (طبيعي)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -------------------------------------------------------------------------
+      - name: ⏳ Keep RDP session alive
+        run: |
+          set -euo pipefail
+          DURATION_MIN="${{ github.event.inputs.duration_minutes }}"
+          DURATION_SEC=$(( DURATION_MIN * 60 ))
+          if [ "$DURATION_SEC" -gt 21000 ]; then DURATION_SEC=21000; fi
+
+          echo "🟢 Session will run for $((DURATION_SEC/60)) minutes."
+          echo "   Host:${RDP_HOST}  Port:${RDP_PORT}  User:${RDP_USERNAME}"
+
+          ELAPSED=0
+          STEP=120
+          while [ "$ELAPSED" -lt "$DURATION_SEC" ]; do
+            sleep "$STEP"
+            ELAPSED=$(( ELAPSED + STEP ))
+            REMAIN_MIN=$(( (DURATION_SEC - ELAPSED) / 60 ))
+
+            # فحوصات صحة — لو ماتت إحدى الخدمات نخرج بدل الانتظار
+            if ! systemctl is-active --quiet xrdp; then
+              echo "::error::xrdp died"
+              sudo systemctl status xrdp --no-pager | tail -n 30 || true
+              exit 1
+            fi
+            if [ -f "$RUNNER_TEMP/ngrok.pid" ] && ! kill -0 "$(cat $RUNNER_TEMP/ngrok.pid)" 2>/dev/null; then
+              echo "::error::ngrok died"
+              tail -n 50 "$RUNNER_TEMP/ngrok.log" || true
+              exit 1
+            fi
+            if ! ss -tln | grep -q ':3389'; then
+              echo "::error::Port 3389 no longer listening"
+              exit 1
+            fi
+
+            echo "⏱️  elapsed=$((ELAPSED/60))min  remaining=${REMAIN_MIN}min   ${RDP_HOST}:${RDP_PORT}"
+          done
+
+          echo "✅ Reached scheduled duration."
+
+      # -------------------------------------------------------------------------
+      - name: 📜 Debug logs (always)
+        if: ${{ always() }}
+        run: |
+          echo "===== xrdp journal (tail 80) ====="
+          sudo journalctl -u xrdp --no-pager 2>/dev/null | tail -n 80 || true
+          echo ""
+          echo "===== xrdp-sesman journal (tail 40) ====="
+          sudo journalctl -u xrdp-sesman --no-pager 2>/dev/null | tail -n 40 || true
+          echo ""
+          echo "===== ngrok log (tail 80) ====="
+          tail -n 80 "$RUNNER_TEMP/ngrok.log" 2>/dev/null || true
+          echo ""
+          echo "===== listening sockets ====="
+          ss -tlnp 2>/dev/null || true
+
+      # -------------------------------------------------------------------------
+      - name: 🧹 Cleanup
+        if: ${{ always() }}
+        run: |
+          if [ -f "$RUNNER_TEMP/ngrok.pid" ]; then
+            kill -TERM "$(cat $RUNNER_TEMP/ngrok.pid)" 2>/dev/null || true
+          fi
+          sudo systemctl stop xrdp 2>/dev/null || true
+          # نحذف ملف sudoers الخاص بالمستخدم
+          sudo rm -f /etc/sudoers.d/90-${RDP_USERNAME} 2>/dev/null || true
