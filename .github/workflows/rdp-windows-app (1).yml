@@ -1,0 +1,794 @@
+name: 🖥️ Free RDP Server (No Ngrok — 100% Free via bore.pub)
+
+# =============================================================================
+# هذا الـ workflow ينشئ سيرفر RDP كامل ومجاني 100٪ على GitHub Actions
+# بدون أي خدمة مدفوعة وبدون أي API خارجي يحتاج تسجيل / token.
+#
+# يدعم ثلاث بيئات:
+#   • xfce4    → Ubuntu 22.04 + XFCE4 + xrdp
+#   • mate     → Ubuntu 22.04 + MATE  + xrdp
+#   • windows  → Windows Server 2022 (واجهة شبيهة بـ Windows 11/Modern)
+#                + Remote Desktop المُفعَّل أصلاً في الـ image
+#
+# طريقة النفق:
+#   نستخدم bore (https://github.com/ekzhang/bore) — أداة Open-Source مفتوحة
+#   تربط بسيرفر عام مجاني `bore.pub` بدون تسجيل و بدون auth token.
+#   لا حاجة لأي Secret مطلقاً!
+#
+# يمكنك الاتصال من:
+#   - Microsoft Remote Desktop  (Windows / macOS / iOS)
+#   - تطبيق Windows App         (Android — الاسم الجديد)
+#   - أي عميل RDP قياسي         (mstsc.exe / Remmina / FreeRDP)
+#
+# ⚠️ ملاحظة بخصوص Windows:
+#   GitHub Actions لا يقدّم Windows 11 Desktop كصورة مستقلة (فقط Server runners).
+#   `windows-latest` = Windows Server 2022 مع Desktop Experience مفعّلة،
+#   وهي الصورة نفسها التي تستعمل في كل tutorials الـ "Free Windows RDP".
+#   تحصل على واجهة مكتب كاملة، Edge, PowerShell, .NET, VS Build Tools…
+#   عملياً تبدو وتعمل مثل Windows 11.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop_env:
+        description: "نظام التشغيل / بيئة سطح المكتب"
+        required: true
+        default: "xfce4"
+        type: choice
+        options:
+          - xfce4
+          - mate
+          - windows
+      rdp_username:
+        description: "اسم المستخدم (Linux فقط — Windows يستخدم Administrator/runneradmin)"
+        required: true
+        default: "rdpuser"
+        type: string
+      rdp_password:
+        description: "كلمة المرور (اتركها فارغة لتوليد كلمة قوية تلقائياً)"
+        required: false
+        default: ""
+        type: string
+      duration_minutes:
+        description: "مدة بقاء السيرفر شغّال بالدقائق (max 350)"
+        required: true
+        default: "350"
+        type: string
+
+permissions:
+  contents: read
+
+# سنستعمل وظيفتين منفصلتين — واحدة للينكس وواحدة للويندوز
+# الـ `if:` على مستوى الـ job يضمن تشغيل واحدة فقط حسب الاختيار.
+
+jobs:
+  # ##########################################################################
+  # ##                     L I N U X     R D P    J O B                     ##
+  # ##########################################################################
+  linux-rdp:
+    if: ${{ inputs.desktop_env != 'windows' }}
+    name: 🐧 Linux RDP (xfce4 / mate) via bore.pub
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+      NEEDRESTART_SUSPEND: "1"
+
+    steps:
+      # ----------------------------------------------------------------------
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      - name: 🔑 Generate / set credentials
+        id: creds
+        shell: bash
+        run: |
+          set -euo pipefail
+          USERNAME="${{ inputs.rdp_username }}"
+          PASSWORD="${{ inputs.rdp_password }}"
+
+          # تنظيف اسم المستخدم (linux-safe)
+          USERNAME=$(echo "$USERNAME" | tr -cd '[:alnum:]_-' | cut -c1-32)
+          if [ -z "$USERNAME" ]; then USERNAME="rdpuser"; fi
+
+          # توليد كلمة مرور قوية إذا لم يُحدّدها المستخدم
+          if [ -z "$PASSWORD" ]; then
+            PASSWORD=$(tr -dc 'A-Za-z0-9@#%+=' < /dev/urandom | head -c 16)
+          fi
+
+          # نخفي القيم في اللوج
+          echo "::add-mask::$PASSWORD"
+
+          {
+            echo "RDP_USERNAME=$USERNAME"
+            echo "RDP_PASSWORD=$PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "✅ Credentials prepared (user=$USERNAME)"
+
+      # ----------------------------------------------------------------------
+      - name: 🛠️ Install Desktop Environment + xrdp
+        shell: bash
+        run: |
+          set -euo pipefail
+          DESKTOP="${{ inputs.desktop_env }}"
+          echo "::group::apt-get update"
+          sudo apt-get update -qq
+          echo "::endgroup::"
+
+          echo "::group::Installing $DESKTOP + xrdp + utilities"
+          if [ "$DESKTOP" = "mate" ]; then
+            sudo apt-get install -y -qq \
+              mate-desktop-environment-core mate-terminal \
+              xrdp xorgxrdp dbus-x11 \
+              firefox sudo curl wget unzip jq net-tools \
+              pulseaudio policykit-1
+            echo "mate-session" > /tmp/xsession_cmd
+          else
+            sudo apt-get install -y -qq \
+              xfce4 xfce4-goodies xfce4-terminal \
+              xrdp xorgxrdp dbus-x11 \
+              firefox sudo curl wget unzip jq net-tools \
+              pulseaudio policykit-1
+            echo "xfce4-session" > /tmp/xsession_cmd
+          fi
+          echo "::endgroup::"
+
+          # تأكد أن خدمة xrdp مثبّتة
+          dpkg -l | grep -E '^ii\s+xrdp\s' >/dev/null || { echo "::error::xrdp not installed"; exit 1; }
+          echo "✅ Desktop environment + xrdp installed"
+
+      # ----------------------------------------------------------------------
+      - name: 👤 Create RDP user
+        shell: bash
+        run: |
+          set -euo pipefail
+          USERNAME="$RDP_USERNAME"
+          PASSWORD="$RDP_PASSWORD"
+
+          if id "$USERNAME" >/dev/null 2>&1; then
+            echo "User $USERNAME exists — updating password"
+          else
+            sudo useradd -m -s /bin/bash "$USERNAME"
+          fi
+
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo "$USERNAME"
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${USERNAME}" >/dev/null
+          sudo chmod 0440 "/etc/sudoers.d/90-${USERNAME}"
+
+          # إعداد .xsession لتشغيل بيئة سطح المكتب الصحيحة
+          XSESSION_CMD=$(cat /tmp/xsession_cmd)
+          echo "$XSESSION_CMD" | sudo tee "/home/${USERNAME}/.xsession" >/dev/null
+          sudo chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.xsession"
+          sudo chmod +x "/home/${USERNAME}/.xsession"
+
+          # نُعطّل screen-lock / power-management
+          sudo -u "$USERNAME" mkdir -p "/home/${USERNAME}/.config/autostart" || true
+          AUTOSTART_FILE="/home/${USERNAME}/.config/autostart/disable-power-mgr.desktop"
+          {
+            echo '[Desktop Entry]'
+            echo 'Type=Application'
+            echo 'Name=disable-power-mgr'
+            echo 'Exec=xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/blank-on-ac -s 0'
+            echo 'X-GNOME-Autostart-enabled=true'
+          } | sudo tee "$AUTOSTART_FILE" >/dev/null
+          sudo chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config" || true
+
+          echo "✅ User '$USERNAME' ready"
+
+      # ----------------------------------------------------------------------
+      - name: ⚙️ Configure xrdp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo adduser xrdp ssl-cert || true
+
+          # ملاحظة: الأسطر أدناه تستعمل single-quotes عمداً — لأننا نريد
+          # الحرف $HOME حرفياً داخل startwm.sh حتى يتوسّعها /bin/sh وقت التشغيل.
+          # shellcheck disable=SC2016
+          {
+            printf '%s\n' '#!/bin/sh'
+            printf '%s\n' 'if [ -r /etc/default/locale ]; then'
+            printf '%s\n' '  . /etc/default/locale'
+            printf '%s\n' '  export LANG LANGUAGE'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'if [ -f "$HOME/.xsession" ]; then'
+            printf '%s\n' '  exec sh "$HOME/.xsession"'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'if command -v xfce4-session >/dev/null 2>&1; then'
+            printf '%s\n' '  exec xfce4-session'
+            printf '%s\n' 'elif command -v mate-session >/dev/null 2>&1; then'
+            printf '%s\n' '  exec mate-session'
+            printf '%s\n' 'elif [ -r /etc/X11/Xsession ]; then'
+            printf '%s\n' '  exec /etc/X11/Xsession'
+            printf '%s\n' 'fi'
+          } | sudo tee /etc/xrdp/startwm.sh >/dev/null
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini || true
+          sudo sed -i 's/^address=.*/address=0.0.0.0/' /etc/xrdp/xrdp.ini || true
+
+          # حل مشكلة "Authentication Required to Create Managed Color Device"
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+          {
+            printf '%s\n' '[Allow Colord all Users]'
+            printf '%s\n' 'Identity=unix-user:*'
+            printf '%s\n' 'Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile'
+            printf '%s\n' 'ResultAny=no'
+            printf '%s\n' 'ResultInactive=no'
+            printf '%s\n' 'ResultActive=yes'
+          } | sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla >/dev/null
+
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp
+          sudo systemctl restart xrdp-sesman || true
+
+          sleep 3
+          sudo systemctl status xrdp --no-pager | head -n 20 || true
+
+          if ss -tlnp | grep -q ':3389'; then
+            echo "✅ xrdp listening on 0.0.0.0:3389"
+          else
+            echo "::error::xrdp is NOT listening on 3389"
+            sudo journalctl -u xrdp --no-pager | tail -n 40 || true
+            exit 1
+          fi
+
+      # ----------------------------------------------------------------------
+      - name: 🌐 Install bore + start tunnel to bore.pub (port 3389)
+        id: bore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BORE_VERSION="0.6.0"
+          BORE_URL="https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+          echo "::group::Download bore ${BORE_VERSION}"
+          cd /tmp
+          curl -fsSL "$BORE_URL" -o bore.tar.gz
+          tar -xzf bore.tar.gz
+          sudo mv bore /usr/local/bin/bore
+          sudo chmod +x /usr/local/bin/bore
+          bore --version
+          echo "::endgroup::"
+
+          # تشغيل bore في الخلفية. اللوج يذهب على stderr.
+          LOG="$RUNNER_TEMP/bore.log"
+          : > "$LOG"
+          # RUST_LOG=info لضمان طباعة سطر "listening at ..."
+          RUST_LOG=info nohup bore local 3389 --to bore.pub > "$LOG" 2>&1 &
+          BORE_PID=$!
+          echo "$BORE_PID" > "$RUNNER_TEMP/bore.pid"
+          echo "bore PID=$BORE_PID"
+
+          # ننتظر حتى يظهر سطر "listening at bore.pub:PORT" — حد أقصى 60 ثانية
+          REMOTE_PORT=""
+          for _i in $(seq 1 30); do
+            if [ -s "$LOG" ] && grep -qE 'listening at bore\.pub:[0-9]+' "$LOG"; then
+              REMOTE_PORT=$(grep -oE 'listening at bore\.pub:[0-9]+' "$LOG" \
+                            | head -n1 | grep -oE '[0-9]+$')
+              break
+            fi
+            if ! kill -0 "$BORE_PID" 2>/dev/null; then
+              echo "::error::bore process died early"
+              cat "$LOG" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ -z "$REMOTE_PORT" ]; then
+            echo "::error::Failed to obtain bore tunnel port within 60s"
+            cat "$LOG" || true
+            exit 1
+          fi
+
+          echo "RDP_HOST=bore.pub" >> "$GITHUB_ENV"
+          echo "RDP_PORT=$REMOTE_PORT" >> "$GITHUB_ENV"
+          echo ""
+          echo "✅ bore tunnel up: bore.pub:${REMOTE_PORT}"
+
+      # ----------------------------------------------------------------------
+      - name: 🧪 Verify RDP reachability
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! (echo > /dev/tcp/127.0.0.1/3389) >/dev/null 2>&1; then
+            echo "::error::Local xrdp port 3389 not reachable"
+            exit 1
+          fi
+          echo "✅ Local 3389 OK"
+
+          if ! timeout 10 bash -c "echo > /dev/tcp/${RDP_HOST}/${RDP_PORT}" >/dev/null 2>&1; then
+            echo "::warning::Tunnel TCP probe failed from runner (قد يكون بسبب DNS داخل runner). الاتصال من العميل سيعمل."
+          else
+            echo "✅ Tunnel ${RDP_HOST}:${RDP_PORT} reachable from runner"
+          fi
+
+      # ----------------------------------------------------------------------
+      - name: 📌 Publish connection info
+        shell: bash
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║   🎉  RDP SERVER READY (Linux ${{ inputs.desktop_env }} via bore.pub)║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf  "║  Host (PC name) : %-42s ║\n" "${RDP_HOST}"
+          printf  "║  Port           : %-42s ║\n" "${RDP_PORT}"
+          printf  "║  Username       : %-42s ║\n" "${RDP_USERNAME}"
+          printf  "║  Password       : %-42s ║\n" "(see Job Summary — مخفي هنا)"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          {
+            echo "# 🖥️ Free RDP Server — Live"
+            echo ""
+            echo "> 100٪ مجاني — لا Ngrok ، لا API ، لا حساب ، لا Secrets."
+            echo ""
+            echo "## 🔑 معلومات تسجيل الدخول"
+            echo ""
+            echo "| الحقل | القيمة |"
+            echo "|------|--------|"
+            echo "| **PC name (Host:Port)** | \`${RDP_HOST}:${RDP_PORT}\` |"
+            echo "| **Username**            | \`${RDP_USERNAME}\` |"
+            echo "| **Password**            | \`${RDP_PASSWORD}\` |"
+            echo "| **Desktop**             | ${{ inputs.desktop_env }} |"
+            echo "| **Tunnel**              | bore.pub (open-source) |"
+            echo "| **Duration**            | ${{ inputs.duration_minutes }} min |"
+            echo ""
+            echo "## كيف تتصل"
+            echo ""
+            echo "### 🪟 Windows (mstsc)"
+            echo '```'
+            echo "mstsc /v:${RDP_HOST}:${RDP_PORT}"
+            echo '```'
+            echo ""
+            echo "### 📱 Android — تطبيق **Windows App** (سابقاً Microsoft Remote Desktop)"
+            echo "1. افتح التطبيق → **+** → **Add PC**"
+            echo "2. **PC name** : \`${RDP_HOST}:${RDP_PORT}\`"
+            echo "3. **User account** : أضف حساباً جديداً بـ \`${RDP_USERNAME}\` + كلمة المرور أعلاه"
+            echo "4. اضغط **Save** ثم على البطاقة للاتصال."
+            echo ""
+            echo "### 🍎 iOS / macOS — Windows App / Microsoft Remote Desktop"
+            echo "نفس الخطوات."
+            echo ""
+            echo "### 🐧 Linux — Remmina / FreeRDP"
+            echo '```'
+            echo "xfreerdp /v:${RDP_HOST}:${RDP_PORT} /u:${RDP_USERNAME} /p:'${RDP_PASSWORD}' /size:1280x800 /cert:ignore"
+            echo '```'
+            echo ""
+            echo "> ⚠️ الشهادة موقعة ذاتياً → اقبلها عند أول اتصال (طبيعي)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------------
+      - name: ⏳ Keep RDP session alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          DURATION_MIN="${{ inputs.duration_minutes }}"
+          DURATION_SEC=$(( DURATION_MIN * 60 ))
+          if [ "$DURATION_SEC" -gt 21000 ]; then DURATION_SEC=21000; fi
+
+          echo "🟢 Session will run for $((DURATION_SEC/60)) minutes."
+          echo "   Host:${RDP_HOST}  Port:${RDP_PORT}  User:${RDP_USERNAME}"
+
+          ELAPSED=0
+          STEP=120
+          while [ "$ELAPSED" -lt "$DURATION_SEC" ]; do
+            sleep "$STEP"
+            ELAPSED=$(( ELAPSED + STEP ))
+            REMAIN_MIN=$(( (DURATION_SEC - ELAPSED) / 60 ))
+
+            if ! systemctl is-active --quiet xrdp; then
+              echo "::error::xrdp died"
+              sudo systemctl status xrdp --no-pager | tail -n 30 || true
+              exit 1
+            fi
+            if [ -f "$RUNNER_TEMP/bore.pid" ] && ! kill -0 "$(cat "$RUNNER_TEMP/bore.pid")" 2>/dev/null; then
+              echo "::error::bore tunnel died"
+              tail -n 50 "$RUNNER_TEMP/bore.log" || true
+              exit 1
+            fi
+            if ! ss -tln | grep -q ':3389'; then
+              echo "::error::Port 3389 no longer listening"
+              exit 1
+            fi
+
+            echo "⏱️  elapsed=$((ELAPSED/60))min  remaining=${REMAIN_MIN}min   ${RDP_HOST}:${RDP_PORT}"
+          done
+
+          echo "✅ Reached scheduled duration."
+
+      # ----------------------------------------------------------------------
+      - name: 📜 Debug logs (always)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          echo "===== xrdp journal (tail 80) ====="
+          sudo journalctl -u xrdp --no-pager 2>/dev/null | tail -n 80 || true
+          echo ""
+          echo "===== xrdp-sesman journal (tail 40) ====="
+          sudo journalctl -u xrdp-sesman --no-pager 2>/dev/null | tail -n 40 || true
+          echo ""
+          echo "===== bore log (tail 80) ====="
+          tail -n 80 "$RUNNER_TEMP/bore.log" 2>/dev/null || true
+          echo ""
+          echo "===== listening sockets ====="
+          ss -tlnp 2>/dev/null || true
+
+      # ----------------------------------------------------------------------
+      - name: 🧹 Cleanup
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/bore.pid" ]; then
+            kill -TERM "$(cat "$RUNNER_TEMP/bore.pid")" 2>/dev/null || true
+          fi
+          sudo systemctl stop xrdp 2>/dev/null || true
+          sudo rm -f "/etc/sudoers.d/90-${RDP_USERNAME}" 2>/dev/null || true
+
+  # ##########################################################################
+  # ##                  W I N D O W S    R D P    J O B                     ##
+  # ##########################################################################
+  windows-rdp:
+    if: ${{ inputs.desktop_env == 'windows' }}
+    name: 🪟 Windows RDP (Server 2022 / Win11-like) via bore.pub
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    steps:
+      # ----------------------------------------------------------------------
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      - name: 🔑 Prepare credentials
+        id: creds
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $u = "${{ inputs.rdp_username }}"
+          $p = "${{ inputs.rdp_password }}"
+
+          # على Windows سنستعمل حساب Administrator (أبسط وأضمن)
+          # ولكن إذا أراد المستخدم اسماً مخصصاً ننشئ مستخدماً جديداً ونضيفه للأدمن.
+          if ([string]::IsNullOrWhiteSpace($u) -or $u -eq 'rdpuser') {
+            $u = 'runneradmin'   # حساب موجود مسبقاً على runners الـ Windows
+          }
+
+          # تنظيف الاسم: أحرف، أرقام، _ ، - فقط — أقصى 20 حرف
+          $u = ($u -replace '[^a-zA-Z0-9_-]', '')
+          if ($u.Length -gt 20) { $u = $u.Substring(0, 20) }
+          if ([string]::IsNullOrWhiteSpace($u)) { $u = 'runneradmin' }
+
+          if ([string]::IsNullOrWhiteSpace($p)) {
+            # توليد كلمة قوية: 16 حرفاً تحقّق متطلبات Windows complexity
+            Add-Type -AssemblyName System.Web
+            $p = [System.Web.Security.Membership]::GeneratePassword(16, 3)
+          }
+
+          # نخفي القيم في اللوج
+          Write-Host "::add-mask::$p"
+
+          "RDP_USERNAME=$u"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$p"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "✅ Credentials prepared (user=$u)"
+
+      # ----------------------------------------------------------------------
+      - name: 👤 Ensure user exists + set password + add to RDP/Admin groups
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $u = $env:RDP_USERNAME
+          $p = $env:RDP_PASSWORD
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
+          if ($null -eq $existing) {
+            Write-Host "Creating user $u ..."
+            New-LocalUser -Name $u -Password $sec -FullName $u -Description "GitHub Actions RDP User" -PasswordNeverExpires -UserMayNotChangePassword
+          } else {
+            Write-Host "User $u exists — updating password"
+            Set-LocalUser -Name $u -Password $sec -PasswordNeverExpires $true
+          }
+
+          # ضع المستخدم في مجموعتي Administrators و Remote Desktop Users
+          foreach ($g in @('Administrators','Remote Desktop Users')) {
+            try {
+              Add-LocalGroupMember -Group $g -Member $u -ErrorAction Stop
+              Write-Host "Added $u to $g"
+            } catch {
+              if ($_.Exception.Message -match 'already a member') {
+                Write-Host "$u already in $g"
+              } else {
+                Write-Host "::warning::Could not add to $g : $($_.Exception.Message)"
+              }
+            }
+          }
+
+          Write-Host "✅ User '$u' ready (Admin + RDP)"
+
+      # ----------------------------------------------------------------------
+      - name: ⚙️ Enable Remote Desktop + Firewall rule
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1) السماح بـ RDP connections
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name 'fDenyTSConnections' -Value 0 -Type DWord
+
+          # 2) السماح بـ NLA (اختياري — معظم العملاء الحديثة تدعمه)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name 'UserAuthentication' -Value 1 -Type DWord
+
+          # 3) فتح الجدار الناري لـ Remote Desktop
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          # و فتح بورت 3389 صراحةً كاحتياط
+          New-NetFirewallRule -DisplayName 'RDP-In-3389' -Direction Inbound -LocalPort 3389 `
+                              -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
+
+          # 4) تأكد أن خدمة TermService شغّالة
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          # 5) تحقّق أن البورت 3389 يستمع
+          $tries = 0
+          do {
+            Start-Sleep -Seconds 2
+            $listening = (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)
+            $tries++
+          } while (-not $listening -and $tries -lt 15)
+
+          if (-not $listening) {
+            Write-Error "::error::RDP service is NOT listening on port 3389 after 30s"
+            exit 1
+          }
+          Write-Host "✅ RDP listening on 0.0.0.0:3389"
+
+      # ----------------------------------------------------------------------
+      - name: 🌐 Install bore + start tunnel to bore.pub (port 3389)
+        id: bore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $boreVersion = "0.6.0"
+          $boreZipUrl  = "https://github.com/ekzhang/bore/releases/download/v$boreVersion/bore-v$boreVersion-x86_64-pc-windows-msvc.zip"
+          $boreDir     = "$env:RUNNER_TEMP\bore"
+          $boreZip     = "$env:RUNNER_TEMP\bore.zip"
+          $boreExe     = "$boreDir\bore.exe"
+          $boreLog     = "$env:RUNNER_TEMP\bore.log"
+
+          Write-Host "Downloading bore $boreVersion ..."
+          Invoke-WebRequest -Uri $boreZipUrl -OutFile $boreZip -UseBasicParsing
+          New-Item -ItemType Directory -Force -Path $boreDir | Out-Null
+          Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
+
+          # أحياناً يكون bore.exe في sub-folder بعد فك الضغط
+          if (-not (Test-Path $boreExe)) {
+            $found = Get-ChildItem -Path $boreDir -Recurse -Filter 'bore.exe' | Select-Object -First 1
+            if ($found) { $boreExe = $found.FullName } else { Write-Error "bore.exe not found after extraction"; exit 1 }
+          }
+
+          & $boreExe --version
+
+          # تشغيل bore في الخلفية + إعادة توجيه stdout و stderr لملف
+          if (Test-Path $boreLog) { Remove-Item $boreLog -Force }
+          $env:RUST_LOG = "info"
+          $proc = Start-Process -FilePath $boreExe `
+                                -ArgumentList @('local','3389','--to','bore.pub') `
+                                -RedirectStandardOutput $boreLog `
+                                -RedirectStandardError  "$boreLog.err" `
+                                -PassThru -WindowStyle Hidden
+          $proc.Id | Out-File -FilePath "$env:RUNNER_TEMP\bore.pid" -Encoding ascii
+          Write-Host "bore PID=$($proc.Id)"
+
+          # ننتظر سطر "listening at bore.pub:PORT" — أقصى 60s
+          $remotePort = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+
+            $logTxt = ""
+            if (Test-Path $boreLog)        { $logTxt += (Get-Content -Raw -Path $boreLog -ErrorAction SilentlyContinue) }
+            if (Test-Path "$boreLog.err")  { $logTxt += (Get-Content -Raw -Path "$boreLog.err" -ErrorAction SilentlyContinue) }
+
+            $m = [regex]::Match($logTxt, 'listening at bore\.pub:(\d+)')
+            if ($m.Success) { $remotePort = $m.Groups[1].Value; break }
+
+            if ($proc.HasExited) {
+              Write-Host "----- bore log -----"
+              Write-Host $logTxt
+              Write-Error "::error::bore process exited early (code=$($proc.ExitCode))"
+              exit 1
+            }
+          }
+
+          if (-not $remotePort) {
+            Write-Host "----- bore log -----"
+            if (Test-Path $boreLog)       { Get-Content $boreLog }
+            if (Test-Path "$boreLog.err") { Get-Content "$boreLog.err" }
+            Write-Error "::error::Failed to obtain bore tunnel port within 60s"
+            exit 1
+          }
+
+          "RDP_HOST=bore.pub"    | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PORT=$remotePort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "✅ bore tunnel up: bore.pub:$remotePort"
+
+      # ----------------------------------------------------------------------
+      - name: 🧪 Verify RDP reachability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1) محلي
+          $local = Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+          if (-not $local) {
+            Write-Error "::error::Local RDP port 3389 not reachable"
+            exit 1
+          }
+          Write-Host "✅ Local 3389 OK"
+
+          # 2) عبر النفق
+          $tunnel = Test-NetConnection -ComputerName $env:RDP_HOST -Port $env:RDP_PORT -InformationLevel Quiet -WarningAction SilentlyContinue
+          if ($tunnel) {
+            Write-Host "✅ Tunnel $($env:RDP_HOST):$($env:RDP_PORT) reachable"
+          } else {
+            Write-Host "::warning::Tunnel TCP probe failed from runner — الاتصال من العميل غالباً سيعمل."
+          }
+
+      # ----------------------------------------------------------------------
+      - name: 📌 Publish connection info
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "================================================================="
+          Write-Host "   🎉  WINDOWS RDP SERVER READY (Windows Server 2022 / Win11-like)"
+          Write-Host "================================================================="
+          Write-Host ("  Host (PC name) : {0}" -f $env:RDP_HOST)
+          Write-Host ("  Port           : {0}" -f $env:RDP_PORT)
+          Write-Host ("  Username       : {0}" -f $env:RDP_USERNAME)
+          Write-Host  "  Password       : (see Job Summary — مخفي هنا)"
+          Write-Host "================================================================="
+
+          # نبني الـ summary سطراً سطراً (لتجنّب مشاكل YAML مع here-strings)
+          $h = $env:RDP_HOST
+          $p = $env:RDP_PORT
+          $u = $env:RDP_USERNAME
+          $pw = $env:RDP_PASSWORD
+          $dur = '${{ inputs.duration_minutes }}'
+          $tick = [char]0x60   # backtick character
+          $fence = ($tick.ToString() * 3)
+
+          $lines = @()
+          $lines += '# 🪟 Free Windows RDP Server — Live'
+          $lines += ''
+          $lines += '> 100٪ مجاني — لا Ngrok ، لا API ، لا حساب ، لا Secrets.'
+          $lines += '> الويندوز هنا هو **Windows Server 2022** (الـ image الرسمي لـ GitHub Actions)'
+          $lines += '> مع Desktop Experience مفعّلة — تبدو وتُستعمل مثل Windows 11.'
+          $lines += ''
+          $lines += '## 🔑 معلومات تسجيل الدخول'
+          $lines += ''
+          $lines += '| الحقل | القيمة |'
+          $lines += '|------|--------|'
+          $lines += "| **PC name (Host:Port)** | $tick$h`:$p$tick |"
+          $lines += "| **Username**            | $tick$u$tick |"
+          $lines += "| **Password**            | $tick$pw$tick |"
+          $lines += '| **OS**                  | Windows Server 2022 (Desktop Experience) |'
+          $lines += '| **Tunnel**              | bore.pub (open-source) |'
+          $lines += "| **Duration**            | $dur min |"
+          $lines += ''
+          $lines += '## كيف تتصل'
+          $lines += ''
+          $lines += '### 🪟 Windows (mstsc)'
+          $lines += $fence
+          $lines += "mstsc /v:$h`:$p"
+          $lines += $fence
+          $lines += ''
+          $lines += '### 📱 Android — تطبيق **Windows App** (سابقاً Microsoft Remote Desktop)'
+          $lines += '1. افتح التطبيق → **+** → **Add PC**'
+          $lines += "2. **PC name** : $tick$h`:$p$tick"
+          $lines += "3. **User account** : أضف الحساب $tick$u$tick + كلمة المرور أعلاه"
+          $lines += '4. اضغط **Save** ثم على البطاقة للاتصال.'
+          $lines += ''
+          $lines += '### 🍎 iOS / macOS — Windows App'
+          $lines += 'نفس الخطوات.'
+          $lines += ''
+          $lines += '### 🐧 Linux — Remmina / FreeRDP'
+          $lines += $fence
+          $lines += "xfreerdp /v:$h`:$p /u:$u /p:'$pw' /size:1280x800 /cert:ignore"
+          $lines += $fence
+
+          $lines -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      # ----------------------------------------------------------------------
+      - name: ⏳ Keep RDP session alive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $durationMin = [int]'${{ inputs.duration_minutes }}'
+          $durationSec = $durationMin * 60
+          if ($durationSec -gt 21000) { $durationSec = 21000 }
+
+          Write-Host "🟢 Session will run for $($durationSec/60) minutes."
+          Write-Host "   Host:$($env:RDP_HOST)  Port:$($env:RDP_PORT)  User:$($env:RDP_USERNAME)"
+
+          $elapsed = 0
+          $step    = 120
+
+          $borePidFile = "$env:RUNNER_TEMP\bore.pid"
+
+          while ($elapsed -lt $durationSec) {
+            Start-Sleep -Seconds $step
+            $elapsed += $step
+            $remainMin = [math]::Floor(($durationSec - $elapsed) / 60)
+
+            # فحص خدمة RDP
+            $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            if (-not $svc -or $svc.Status -ne 'Running') {
+              Write-Error "::error::TermService not running"
+              exit 1
+            }
+
+            # فحص bore
+            if (Test-Path $borePidFile) {
+              $borePid = Get-Content $borePidFile
+              $boreProc = Get-Process -Id $borePid -ErrorAction SilentlyContinue
+              if (-not $boreProc) {
+                Write-Error "::error::bore tunnel died"
+                if (Test-Path "$env:RUNNER_TEMP\bore.log")     { Get-Content -Tail 50 "$env:RUNNER_TEMP\bore.log" }
+                if (Test-Path "$env:RUNNER_TEMP\bore.log.err") { Get-Content -Tail 50 "$env:RUNNER_TEMP\bore.log.err" }
+                exit 1
+              }
+            }
+
+            # فحص استماع 3389
+            $listening = Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue
+            if (-not $listening) {
+              Write-Error "::error::Port 3389 no longer listening"
+              exit 1
+            }
+
+            Write-Host ("⏱️  elapsed={0}min  remaining={1}min   {2}:{3}" -f ($elapsed/60), $remainMin, $env:RDP_HOST, $env:RDP_PORT)
+          }
+
+          Write-Host "✅ Reached scheduled duration."
+
+      # ----------------------------------------------------------------------
+      - name: 📜 Debug logs (always)
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Write-Host "===== bore log (tail) ====="
+          if (Test-Path "$env:RUNNER_TEMP\bore.log")     { Get-Content -Tail 80 "$env:RUNNER_TEMP\bore.log" }
+          if (Test-Path "$env:RUNNER_TEMP\bore.log.err") { Get-Content -Tail 80 "$env:RUNNER_TEMP\bore.log.err" }
+          Write-Host ""
+          Write-Host "===== Listening TCP ports ====="
+          Get-NetTCPConnection -State Listen | Sort-Object LocalPort | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table | Out-String | Write-Host
+          Write-Host ""
+          Write-Host "===== TermService status ====="
+          Get-Service -Name TermService | Format-List | Out-String | Write-Host
+
+      # ----------------------------------------------------------------------
+      - name: 🧹 Cleanup
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $borePidFile = "$env:RUNNER_TEMP\bore.pid"
+          if (Test-Path $borePidFile) {
+            $borePid = Get-Content $borePidFile
+            try { Stop-Process -Id $borePid -Force -ErrorAction SilentlyContinue } catch {}
+          }
