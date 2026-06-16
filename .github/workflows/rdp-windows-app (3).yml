@@ -1,0 +1,935 @@
+name: 🖥️ Free RDP Server (No Ngrok — 100% Free via bore.pub)
+
+# =============================================================================
+# Free RDP workflow على GitHub Actions — 100٪ مجاني، لا Ngrok، لا API tokens.
+#
+# يدعم:
+#   • xfce4    → Ubuntu 22.04 + XFCE4 + xrdp
+#   • mate     → Ubuntu 22.04 + MATE  + xrdp
+#   • windows  → Windows Server 2022 (Desktop Experience — تبدو مثل Win11)
+#
+# النفق:
+#   bore (https://github.com/ekzhang/bore) → bore.pub (open-source ، بدون auth).
+#
+# 🛠️ تحسينات هذه النسخة (v2 — fix tunnel-died crash):
+#   1) Watchdog يُعيد تشغيل bore تلقائياً عند انقطاعه (back-off قصير).
+#   2) keep-alive loop لا يَقتل الـ job عند انقطاع مؤقت ل bore.
+#   3) إعادة قراءة منفذ bore بعد كل re-connect، وتحديث الملخّص إن تغيّر.
+#   4) مولّد كلمة مرور Windows بديل (بدون System.Web).
+#   5) تتبّع bore بالاسم وليس فقط بالـ PID (يحلّ مشاكل Start-Process / PID).
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop_env:
+        description: "نظام التشغيل / بيئة سطح المكتب"
+        required: true
+        default: "xfce4"
+        type: choice
+        options:
+          - xfce4
+          - mate
+          - windows
+      rdp_username:
+        description: "اسم المستخدم (Linux فقط — Windows يستخدم Administrator/runneradmin)"
+        required: true
+        default: "rdpuser"
+        type: string
+      rdp_password:
+        description: "كلمة المرور (اتركها فارغة لتوليد كلمة قوية تلقائياً)"
+        required: false
+        default: ""
+        type: string
+      duration_minutes:
+        description: "مدة بقاء السيرفر شغّال بالدقائق (max 350)"
+        required: true
+        default: "350"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ##########################################################################
+  # ##                     L I N U X     R D P    J O B                     ##
+  # ##########################################################################
+  linux-rdp:
+    if: ${{ inputs.desktop_env != 'windows' }}
+    name: 🐧 Linux RDP (xfce4 / mate) via bore.pub
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+      NEEDRESTART_SUSPEND: "1"
+
+    steps:
+      # ----------------------------------------------------------------------
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      - name: 🔑 Generate / set credentials
+        id: creds
+        shell: bash
+        run: |
+          set -euo pipefail
+          USERNAME="${{ inputs.rdp_username }}"
+          PASSWORD="${{ inputs.rdp_password }}"
+
+          USERNAME=$(echo "$USERNAME" | tr -cd '[:alnum:]_-' | cut -c1-32)
+          if [ -z "$USERNAME" ]; then USERNAME="rdpuser"; fi
+
+          if [ -z "$PASSWORD" ]; then
+            PASSWORD=$(tr -dc 'A-Za-z0-9@#%+=' < /dev/urandom | head -c 16)
+          fi
+
+          echo "::add-mask::$PASSWORD"
+
+          {
+            echo "RDP_USERNAME=$USERNAME"
+            echo "RDP_PASSWORD=$PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "✅ Credentials prepared (user=$USERNAME)"
+
+      # ----------------------------------------------------------------------
+      - name: 🛠️ Install Desktop Environment + xrdp
+        shell: bash
+        run: |
+          set -euo pipefail
+          DESKTOP="${{ inputs.desktop_env }}"
+          echo "::group::apt-get update"
+          sudo apt-get update -qq
+          echo "::endgroup::"
+
+          echo "::group::Installing $DESKTOP + xrdp + utilities"
+          if [ "$DESKTOP" = "mate" ]; then
+            sudo apt-get install -y -qq \
+              mate-desktop-environment-core mate-terminal \
+              xrdp xorgxrdp dbus-x11 \
+              firefox sudo curl wget unzip jq net-tools \
+              pulseaudio policykit-1
+            echo "mate-session" > /tmp/xsession_cmd
+          else
+            sudo apt-get install -y -qq \
+              xfce4 xfce4-goodies xfce4-terminal \
+              xrdp xorgxrdp dbus-x11 \
+              firefox sudo curl wget unzip jq net-tools \
+              pulseaudio policykit-1
+            echo "xfce4-session" > /tmp/xsession_cmd
+          fi
+          echo "::endgroup::"
+
+          dpkg -l | grep -E '^ii\s+xrdp\s' >/dev/null || { echo "::error::xrdp not installed"; exit 1; }
+          echo "✅ Desktop environment + xrdp installed"
+
+      # ----------------------------------------------------------------------
+      - name: 👤 Create RDP user
+        shell: bash
+        run: |
+          set -euo pipefail
+          USERNAME="$RDP_USERNAME"
+          PASSWORD="$RDP_PASSWORD"
+
+          if id "$USERNAME" >/dev/null 2>&1; then
+            echo "User $USERNAME exists — updating password"
+          else
+            sudo useradd -m -s /bin/bash "$USERNAME"
+          fi
+
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo "$USERNAME"
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${USERNAME}" >/dev/null
+          sudo chmod 0440 "/etc/sudoers.d/90-${USERNAME}"
+
+          XSESSION_CMD=$(cat /tmp/xsession_cmd)
+          echo "$XSESSION_CMD" | sudo tee "/home/${USERNAME}/.xsession" >/dev/null
+          sudo chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.xsession"
+          sudo chmod +x "/home/${USERNAME}/.xsession"
+
+          sudo -u "$USERNAME" mkdir -p "/home/${USERNAME}/.config/autostart" || true
+          AUTOSTART_FILE="/home/${USERNAME}/.config/autostart/disable-power-mgr.desktop"
+          {
+            echo '[Desktop Entry]'
+            echo 'Type=Application'
+            echo 'Name=disable-power-mgr'
+            echo 'Exec=xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/blank-on-ac -s 0'
+            echo 'X-GNOME-Autostart-enabled=true'
+          } | sudo tee "$AUTOSTART_FILE" >/dev/null
+          sudo chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config" || true
+
+          echo "✅ User '$USERNAME' ready"
+
+      # ----------------------------------------------------------------------
+      - name: ⚙️ Configure xrdp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo adduser xrdp ssl-cert || true
+
+          # shellcheck disable=SC2016
+          {
+            printf '%s\n' '#!/bin/sh'
+            printf '%s\n' 'if [ -r /etc/default/locale ]; then'
+            printf '%s\n' '  . /etc/default/locale'
+            printf '%s\n' '  export LANG LANGUAGE'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'if [ -f "$HOME/.xsession" ]; then'
+            printf '%s\n' '  exec sh "$HOME/.xsession"'
+            printf '%s\n' 'fi'
+            printf '%s\n' 'if command -v xfce4-session >/dev/null 2>&1; then'
+            printf '%s\n' '  exec xfce4-session'
+            printf '%s\n' 'elif command -v mate-session >/dev/null 2>&1; then'
+            printf '%s\n' '  exec mate-session'
+            printf '%s\n' 'elif [ -r /etc/X11/Xsession ]; then'
+            printf '%s\n' '  exec /etc/X11/Xsession'
+            printf '%s\n' 'fi'
+          } | sudo tee /etc/xrdp/startwm.sh >/dev/null
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini || true
+          sudo sed -i 's/^address=.*/address=0.0.0.0/' /etc/xrdp/xrdp.ini || true
+
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+          {
+            printf '%s\n' '[Allow Colord all Users]'
+            printf '%s\n' 'Identity=unix-user:*'
+            printf '%s\n' 'Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile'
+            printf '%s\n' 'ResultAny=no'
+            printf '%s\n' 'ResultInactive=no'
+            printf '%s\n' 'ResultActive=yes'
+          } | sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla >/dev/null
+
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp
+          sudo systemctl restart xrdp-sesman || true
+
+          sleep 3
+          sudo systemctl status xrdp --no-pager | head -n 20 || true
+
+          if ss -tlnp | grep -q ':3389'; then
+            echo "✅ xrdp listening on 0.0.0.0:3389"
+          else
+            echo "::error::xrdp is NOT listening on 3389"
+            sudo journalctl -u xrdp --no-pager | tail -n 40 || true
+            exit 1
+          fi
+
+      # ----------------------------------------------------------------------
+      - name: 🌐 Install bore + start tunnel with auto-restart watchdog
+        id: bore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BORE_VERSION="0.6.0"
+          BORE_URL="https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+          echo "::group::Download bore ${BORE_VERSION}"
+          cd /tmp
+          curl -fsSL "$BORE_URL" -o bore.tar.gz
+          tar -xzf bore.tar.gz
+          sudo mv bore /usr/local/bin/bore
+          sudo chmod +x /usr/local/bin/bore
+          bore --version
+          echo "::endgroup::"
+
+          LOG="$RUNNER_TEMP/bore.log"
+          WATCHDOG_LOG="$RUNNER_TEMP/watchdog.log"
+          PORT_FILE="$RUNNER_TEMP/bore.port"
+          : > "$LOG"
+          : > "$WATCHDOG_LOG"
+
+          # ---- Watchdog script: يعيد تشغيل bore إذا مات ----
+          WATCHDOG_SCRIPT="$RUNNER_TEMP/bore-watchdog.sh"
+          cat > "$WATCHDOG_SCRIPT" << 'EOF'
+          #!/bin/bash
+          # Watchdog: keeps bore tunnel alive forever, restart on death.
+          LOG="$1"
+          PORT_FILE="$2"
+          WATCHDOG_LOG="$3"
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            echo "[watchdog] $(date -u +%H:%M:%S) attempt #${attempt} — starting bore..." >> "$WATCHDOG_LOG"
+            RUST_LOG=info /usr/local/bin/bore local 3389 --to bore.pub >> "$LOG" 2>&1
+            EXIT=$?
+            echo "[watchdog] $(date -u +%H:%M:%S) bore exited with code=$EXIT" >> "$WATCHDOG_LOG"
+            # Back-off: 5s ثم 10s ثم 15s ثم max 30s
+            sleep_for=$(( attempt < 6 ? attempt * 5 : 30 ))
+            sleep "$sleep_for"
+          done
+          EOF
+          chmod +x "$WATCHDOG_SCRIPT"
+
+          # شغّل الـ watchdog في الخلفية مع detach
+          nohup "$WATCHDOG_SCRIPT" "$LOG" "$PORT_FILE" "$WATCHDOG_LOG" >/dev/null 2>&1 &
+          WATCHDOG_PID=$!
+          disown
+          echo "$WATCHDOG_PID" > "$RUNNER_TEMP/watchdog.pid"
+          echo "watchdog PID=$WATCHDOG_PID"
+
+          # انتظر حتى يطبع bore سطر "listening at bore.pub:PORT"
+          REMOTE_PORT=""
+          for _i in $(seq 1 40); do
+            if [ -s "$LOG" ] && grep -qE 'listening at bore\.pub:[0-9]+' "$LOG"; then
+              REMOTE_PORT=$(grep -oE 'listening at bore\.pub:[0-9]+' "$LOG" \
+                            | tail -n1 | grep -oE '[0-9]+$')
+              break
+            fi
+            if ! kill -0 "$WATCHDOG_PID" 2>/dev/null; then
+              echo "::error::watchdog died too early"
+              cat "$LOG" || true
+              cat "$WATCHDOG_LOG" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ -z "$REMOTE_PORT" ]; then
+            echo "::error::Failed to obtain bore tunnel port within 80s"
+            cat "$LOG" || true
+            cat "$WATCHDOG_LOG" || true
+            exit 1
+          fi
+
+          echo "$REMOTE_PORT" > "$PORT_FILE"
+          echo "RDP_HOST=bore.pub" >> "$GITHUB_ENV"
+          echo "RDP_PORT=$REMOTE_PORT" >> "$GITHUB_ENV"
+          echo ""
+          echo "✅ bore tunnel up: bore.pub:${REMOTE_PORT}  (watchdog=${WATCHDOG_PID})"
+
+      # ----------------------------------------------------------------------
+      - name: 🧪 Verify RDP reachability
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! (echo > /dev/tcp/127.0.0.1/3389) >/dev/null 2>&1; then
+            echo "::error::Local xrdp port 3389 not reachable"
+            exit 1
+          fi
+          echo "✅ Local 3389 OK"
+
+          if ! timeout 10 bash -c "echo > /dev/tcp/${RDP_HOST}/${RDP_PORT}" >/dev/null 2>&1; then
+            echo "::warning::Tunnel TCP probe failed from runner (طبيعي — قيود شبكة runner). الاتصال من العميل سيعمل."
+          else
+            echo "✅ Tunnel ${RDP_HOST}:${RDP_PORT} reachable from runner"
+          fi
+
+      # ----------------------------------------------------------------------
+      - name: 📌 Publish connection info
+        shell: bash
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║   🎉  RDP SERVER READY (Linux ${{ inputs.desktop_env }} via bore.pub)║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          printf  "║  Host (PC name) : %-42s ║\n" "${RDP_HOST}"
+          printf  "║  Port           : %-42s ║\n" "${RDP_PORT}"
+          printf  "║  Username       : %-42s ║\n" "${RDP_USERNAME}"
+          printf  "║  Password       : %-42s ║\n" "(see Job Summary — مخفي هنا)"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          {
+            echo "# 🖥️ Free RDP Server — Live"
+            echo ""
+            echo "> 100٪ مجاني — لا Ngrok ، لا API ، لا حساب ، لا Secrets."
+            echo ""
+            echo "## 🔑 معلومات تسجيل الدخول"
+            echo ""
+            echo "| الحقل | القيمة |"
+            echo "|------|--------|"
+            echo "| **PC name (Host:Port)** | \`${RDP_HOST}:${RDP_PORT}\` |"
+            echo "| **Username**            | \`${RDP_USERNAME}\` |"
+            echo "| **Password**            | \`${RDP_PASSWORD}\` |"
+            echo "| **Desktop**             | ${{ inputs.desktop_env }} |"
+            echo "| **Tunnel**              | bore.pub (open-source, auto-restart) |"
+            echo "| **Duration**            | ${{ inputs.duration_minutes }} min |"
+            echo ""
+            echo "> ⚠️ إذا انقطع نفق bore فجأة، الـ watchdog يعيد تشغيله تلقائياً."
+            echo "> قد يتغيّر رقم المنفذ بعد إعادة الاتصال — راجع لوج الـ job لمعرفة المنفذ الحالي."
+            echo ""
+            echo "## كيف تتصل"
+            echo ""
+            echo "### 🪟 Windows (mstsc)"
+            echo '```'
+            echo "mstsc /v:${RDP_HOST}:${RDP_PORT}"
+            echo '```'
+            echo ""
+            echo "### 📱 Android — تطبيق **Windows App**"
+            echo "1. افتح التطبيق → **+** → **Add PC**"
+            echo "2. **PC name** : \`${RDP_HOST}:${RDP_PORT}\`"
+            echo "3. **User account** : \`${RDP_USERNAME}\` + كلمة المرور"
+            echo "4. **Save** ثم اضغط البطاقة للاتصال."
+            echo ""
+            echo "### 🍎 iOS / macOS — Windows App / Microsoft Remote Desktop"
+            echo "نفس الخطوات."
+            echo ""
+            echo "### 🐧 Linux — FreeRDP"
+            echo '```'
+            echo "xfreerdp /v:${RDP_HOST}:${RDP_PORT} /u:${RDP_USERNAME} /p:'${RDP_PASSWORD}' /size:1280x800 /cert:ignore"
+            echo '```'
+            echo ""
+            echo "> الشهادة موقعة ذاتياً → اقبلها عند أول اتصال."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------------
+      - name: ⏳ Keep RDP session alive (tolerant)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DURATION_MIN="${{ inputs.duration_minutes }}"
+          DURATION_SEC=$(( DURATION_MIN * 60 ))
+          if [ "$DURATION_SEC" -gt 21000 ]; then DURATION_SEC=21000; fi
+
+          echo "🟢 Session will run for $((DURATION_SEC/60)) minutes."
+          echo "   Host:${RDP_HOST}  Port:${RDP_PORT}  User:${RDP_USERNAME}"
+
+          ELAPSED=0
+          STEP=120
+          LAST_PORT="${RDP_PORT}"
+          BORE_DOWN_COUNTER=0
+
+          while [ "$ELAPSED" -lt "$DURATION_SEC" ]; do
+            sleep "$STEP"
+            ELAPSED=$(( ELAPSED + STEP ))
+            REMAIN_MIN=$(( (DURATION_SEC - ELAPSED) / 60 ))
+
+            # 1) xrdp يجب أن يبقى شغّالاً
+            if ! systemctl is-active --quiet xrdp; then
+              echo "::error::xrdp died — restarting"
+              sudo systemctl restart xrdp || { echo "::error::xrdp restart failed"; exit 1; }
+              sleep 3
+            fi
+
+            # 2) المنفذ 3389 يستمع
+            if ! ss -tln | grep -q ':3389'; then
+              echo "::warning::Port 3389 not listening — restarting xrdp"
+              sudo systemctl restart xrdp || true
+              sleep 3
+            fi
+
+            # 3) Watchdog شغّال (هو الذي يُحيي bore تلقائياً)
+            WATCHDOG_PID_FILE="$RUNNER_TEMP/watchdog.pid"
+            if [ -f "$WATCHDOG_PID_FILE" ]; then
+              WPID=$(cat "$WATCHDOG_PID_FILE")
+              if ! kill -0 "$WPID" 2>/dev/null; then
+                echo "::error::bore watchdog died — cannot recover"
+                tail -n 60 "$RUNNER_TEMP/bore.log" || true
+                tail -n 60 "$RUNNER_TEMP/watchdog.log" || true
+                exit 1
+              fi
+            fi
+
+            # 4) تحقّق من bore (متسامح): إذا غاب لـ 3 دورات متتالية → ننبّه فقط
+            if pgrep -x bore >/dev/null 2>&1; then
+              BORE_DOWN_COUNTER=0
+            else
+              BORE_DOWN_COUNTER=$(( BORE_DOWN_COUNTER + 1 ))
+              echo "::warning::bore process not visible (count=${BORE_DOWN_COUNTER}) — watchdog سيُعيد التشغيل قريباً"
+            fi
+
+            # 5) اقرأ آخر منفذ من لوج bore — إذا تغيّر، أبلغ المستخدم
+            CUR_PORT=$(grep -oE 'listening at bore\.pub:[0-9]+' "$RUNNER_TEMP/bore.log" 2>/dev/null \
+                       | tail -n1 | grep -oE '[0-9]+$' || true)
+            if [ -n "$CUR_PORT" ] && [ "$CUR_PORT" != "$LAST_PORT" ]; then
+              echo "::warning::🔄 bore port changed: ${LAST_PORT} → ${CUR_PORT}"
+              echo "🔄 Use NEW connection string: ${RDP_HOST}:${CUR_PORT}" >> "$GITHUB_STEP_SUMMARY"
+              LAST_PORT="$CUR_PORT"
+            fi
+
+            echo "⏱️  elapsed=$((ELAPSED/60))min  remaining=${REMAIN_MIN}min   ${RDP_HOST}:${LAST_PORT}"
+          done
+
+          echo "✅ Reached scheduled duration."
+
+      # ----------------------------------------------------------------------
+      - name: 📜 Debug logs (always)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          echo "===== xrdp journal (tail 80) ====="
+          sudo journalctl -u xrdp --no-pager 2>/dev/null | tail -n 80 || true
+          echo ""
+          echo "===== xrdp-sesman journal (tail 40) ====="
+          sudo journalctl -u xrdp-sesman --no-pager 2>/dev/null | tail -n 40 || true
+          echo ""
+          echo "===== bore log (tail 80) ====="
+          tail -n 80 "$RUNNER_TEMP/bore.log" 2>/dev/null || true
+          echo ""
+          echo "===== watchdog log (tail 40) ====="
+          tail -n 40 "$RUNNER_TEMP/watchdog.log" 2>/dev/null || true
+          echo ""
+          echo "===== listening sockets ====="
+          ss -tlnp 2>/dev/null || true
+
+      # ----------------------------------------------------------------------
+      - name: 🧹 Cleanup
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          # أوقف watchdog أولاً ثم bore
+          if [ -f "$RUNNER_TEMP/watchdog.pid" ]; then
+            kill -TERM "$(cat "$RUNNER_TEMP/watchdog.pid")" 2>/dev/null || true
+            sleep 1
+          fi
+          pkill -x bore 2>/dev/null || true
+          sudo systemctl stop xrdp 2>/dev/null || true
+          sudo rm -f "/etc/sudoers.d/90-${RDP_USERNAME}" 2>/dev/null || true
+
+  # ##########################################################################
+  # ##                  W I N D O W S    R D P    J O B                     ##
+  # ##########################################################################
+  windows-rdp:
+    if: ${{ inputs.desktop_env == 'windows' }}
+    name: 🪟 Windows RDP (Server 2022 / Win11-like) via bore.pub
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    steps:
+      # ----------------------------------------------------------------------
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------------
+      - name: 🔑 Prepare credentials
+        id: creds
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $u = "${{ inputs.rdp_username }}"
+          $p = "${{ inputs.rdp_password }}"
+
+          if ([string]::IsNullOrWhiteSpace($u) -or $u -eq 'rdpuser') {
+            $u = 'runneradmin'
+          }
+
+          $u = ($u -replace '[^a-zA-Z0-9_-]', '')
+          if ($u.Length -gt 20) { $u = $u.Substring(0, 20) }
+          if ([string]::IsNullOrWhiteSpace($u)) { $u = 'runneradmin' }
+
+          if ([string]::IsNullOrWhiteSpace($p)) {
+            # ---- مولّد كلمة مرور قوية بدون الاعتماد على System.Web ----
+            # متطلبات Windows: حرف كبير + صغير + رقم + رمز
+            $lower  = 'abcdefghijkmnopqrstuvwxyz'
+            $upper  = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+            $digits = '23456789'
+            $symb   = '@#%+=!_-'
+            $all    = ($lower + $upper + $digits + $symb).ToCharArray()
+
+            $rng    = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            $bytes  = New-Object byte[] 16
+            $rng.GetBytes($bytes)
+
+            $sb = New-Object System.Text.StringBuilder
+            # نضمن وجود حرف من كل صنف
+            [void]$sb.Append($upper[$bytes[0] % $upper.Length])
+            [void]$sb.Append($lower[$bytes[1] % $lower.Length])
+            [void]$sb.Append($digits[$bytes[2] % $digits.Length])
+            [void]$sb.Append($symb[$bytes[3]  % $symb.Length])
+            for ($i = 4; $i -lt 16; $i++) {
+              [void]$sb.Append($all[$bytes[$i] % $all.Length])
+            }
+            $p = $sb.ToString()
+          }
+
+          Write-Host "::add-mask::$p"
+
+          "RDP_USERNAME=$u" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$p" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "✅ Credentials prepared (user=$u)"
+
+      # ----------------------------------------------------------------------
+      - name: 👤 Ensure user exists + set password + add to RDP/Admin groups
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $u = $env:RDP_USERNAME
+          $p = $env:RDP_PASSWORD
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
+          if ($null -eq $existing) {
+            Write-Host "Creating user $u ..."
+            New-LocalUser -Name $u -Password $sec -FullName $u `
+                          -Description "GitHub Actions RDP User" `
+                          -PasswordNeverExpires -UserMayNotChangePassword
+          } else {
+            Write-Host "User $u exists — updating password"
+            Set-LocalUser -Name $u -Password $sec -PasswordNeverExpires $true
+          }
+
+          foreach ($g in @('Administrators','Remote Desktop Users')) {
+            try {
+              Add-LocalGroupMember -Group $g -Member $u -ErrorAction Stop
+              Write-Host "Added $u to $g"
+            } catch {
+              if ($_.Exception.Message -match 'already a member') {
+                Write-Host "$u already in $g"
+              } else {
+                Write-Host "::warning::Could not add to $g : $($_.Exception.Message)"
+              }
+            }
+          }
+
+          Write-Host "✅ User '$u' ready (Admin + RDP)"
+
+      # ----------------------------------------------------------------------
+      - name: ⚙️ Enable Remote Desktop + Firewall rule
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name 'fDenyTSConnections' -Value 0 -Type DWord
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name 'UserAuthentication' -Value 1 -Type DWord
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'RDP-In-3389' -Direction Inbound -LocalPort 3389 `
+                              -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          $tries = 0
+          do {
+            Start-Sleep -Seconds 2
+            $listening = (Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue)
+            $tries++
+          } while (-not $listening -and $tries -lt 15)
+
+          if (-not $listening) {
+            Write-Error "::error::RDP service is NOT listening on port 3389 after 30s"
+            exit 1
+          }
+          Write-Host "✅ RDP listening on 0.0.0.0:3389"
+
+      # ----------------------------------------------------------------------
+      - name: 🌐 Install bore + start tunnel with auto-restart watchdog
+        id: bore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $boreVersion = "0.6.0"
+          $boreZipUrl  = "https://github.com/ekzhang/bore/releases/download/v$boreVersion/bore-v$boreVersion-x86_64-pc-windows-msvc.zip"
+          $boreDir     = "$env:RUNNER_TEMP\bore"
+          $boreZip     = "$env:RUNNER_TEMP\bore.zip"
+          $boreExe     = "$boreDir\bore.exe"
+          $boreLog     = "$env:RUNNER_TEMP\bore.log"
+          $watchdogLog = "$env:RUNNER_TEMP\watchdog.log"
+
+          Write-Host "Downloading bore $boreVersion ..."
+          Invoke-WebRequest -Uri $boreZipUrl -OutFile $boreZip -UseBasicParsing
+          New-Item -ItemType Directory -Force -Path $boreDir | Out-Null
+          Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
+
+          if (-not (Test-Path $boreExe)) {
+            $found = Get-ChildItem -Path $boreDir -Recurse -Filter 'bore.exe' | Select-Object -First 1
+            if ($found) { $boreExe = $found.FullName } else { Write-Error "bore.exe not found after extraction"; exit 1 }
+          }
+
+          & $boreExe --version
+
+          # نظّف اللوجات
+          if (Test-Path $boreLog)     { Remove-Item $boreLog -Force }
+          if (Test-Path $watchdogLog) { Remove-Item $watchdogLog -Force }
+          New-Item -ItemType File -Path $boreLog     -Force | Out-Null
+          New-Item -ItemType File -Path $watchdogLog -Force | Out-Null
+
+          # ---- Watchdog script (PowerShell) ----
+          $watchdogScript = "$env:RUNNER_TEMP\bore-watchdog.ps1"
+          $watchdogBody = @'
+          param([string]$BoreExe, [string]$Log, [string]$WatchdogLog)
+          $ErrorActionPreference = 'Continue'
+          $env:RUST_LOG = 'info'
+          $attempt = 0
+          while ($true) {
+            $attempt++
+            $ts = (Get-Date).ToUniversalTime().ToString('HH:mm:ss')
+            Add-Content -Path $WatchdogLog -Value "[watchdog] $ts attempt #$attempt - starting bore..."
+            try {
+              # نشغّل bore في الـ foreground للـ watchdog، ونوجّه stdout/stderr للوج
+              $p = Start-Process -FilePath $BoreExe `
+                                 -ArgumentList @('local','3389','--to','bore.pub') `
+                                 -NoNewWindow -PassThru `
+                                 -RedirectStandardOutput $Log `
+                                 -RedirectStandardError  ($Log + '.err')
+              $p.WaitForExit()
+              $code = $p.ExitCode
+            } catch {
+              $code = -1
+              Add-Content -Path $WatchdogLog -Value "[watchdog] start error: $($_.Exception.Message)"
+            }
+            $ts = (Get-Date).ToUniversalTime().ToString('HH:mm:ss')
+            Add-Content -Path $WatchdogLog -Value "[watchdog] $ts bore exited code=$code"
+            $sleepFor = if ($attempt -lt 6) { $attempt * 5 } else { 30 }
+            Start-Sleep -Seconds $sleepFor
+          }
+          '@
+          Set-Content -Path $watchdogScript -Value $watchdogBody -Encoding utf8
+
+          # شغّل الـ watchdog في عملية منفصلة (يستمر بعد نهاية الـ step)
+          $wd = Start-Process -FilePath 'pwsh.exe' `
+                              -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File', $watchdogScript, $boreExe, $boreLog, $watchdogLog) `
+                              -PassThru -WindowStyle Hidden
+          $wd.Id | Out-File -FilePath "$env:RUNNER_TEMP\watchdog.pid" -Encoding ascii
+          Write-Host "watchdog PID=$($wd.Id)"
+
+          # ننتظر ظهور port في لوج bore (حتى 80s)
+          $remotePort = $null
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 2
+
+            $logTxt = ''
+            if (Test-Path $boreLog)         { $logTxt += (Get-Content -Raw -Path $boreLog          -ErrorAction SilentlyContinue) }
+            if (Test-Path ($boreLog+'.err')) { $logTxt += (Get-Content -Raw -Path ($boreLog+'.err') -ErrorAction SilentlyContinue) }
+
+            $matches = [regex]::Matches($logTxt, 'listening at bore\.pub:(\d+)')
+            if ($matches.Count -gt 0) {
+              $remotePort = $matches[$matches.Count - 1].Groups[1].Value
+              break
+            }
+
+            if ($wd.HasExited) {
+              Write-Host "----- watchdog log -----"
+              if (Test-Path $watchdogLog) { Get-Content $watchdogLog }
+              Write-Host "----- bore log -----"
+              Write-Host $logTxt
+              Write-Error "::error::watchdog exited early (code=$($wd.ExitCode))"
+              exit 1
+            }
+          }
+
+          if (-not $remotePort) {
+            Write-Host "----- watchdog log -----"
+            if (Test-Path $watchdogLog) { Get-Content $watchdogLog }
+            Write-Host "----- bore log -----"
+            if (Test-Path $boreLog)         { Get-Content $boreLog }
+            if (Test-Path ($boreLog+'.err')) { Get-Content ($boreLog+'.err') }
+            Write-Error "::error::Failed to obtain bore tunnel port within 80s"
+            exit 1
+          }
+
+          "RDP_HOST=bore.pub"    | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PORT=$remotePort" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "✅ bore tunnel up: bore.pub:$remotePort (watchdog=$($wd.Id))"
+
+      # ----------------------------------------------------------------------
+      - name: 🧪 Verify RDP reachability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $local = Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+          if (-not $local) {
+            Write-Error "::error::Local RDP port 3389 not reachable"
+            exit 1
+          }
+          Write-Host "✅ Local 3389 OK"
+
+          $tunnel = Test-NetConnection -ComputerName $env:RDP_HOST -Port $env:RDP_PORT -InformationLevel Quiet -WarningAction SilentlyContinue
+          if ($tunnel) {
+            Write-Host "✅ Tunnel $($env:RDP_HOST):$($env:RDP_PORT) reachable"
+          } else {
+            Write-Host "::warning::Tunnel TCP probe failed from runner — الاتصال من العميل غالباً سيعمل."
+          }
+
+      # ----------------------------------------------------------------------
+      - name: 📌 Publish connection info
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "================================================================="
+          Write-Host "   🎉  WINDOWS RDP SERVER READY (Windows Server 2022 / Win11-like)"
+          Write-Host "================================================================="
+          Write-Host ("  Host (PC name) : {0}" -f $env:RDP_HOST)
+          Write-Host ("  Port           : {0}" -f $env:RDP_PORT)
+          Write-Host ("  Username       : {0}" -f $env:RDP_USERNAME)
+          Write-Host  "  Password       : (see Job Summary — مخفي هنا)"
+          Write-Host "================================================================="
+
+          $h = $env:RDP_HOST
+          $p = $env:RDP_PORT
+          $u = $env:RDP_USERNAME
+          $pw = $env:RDP_PASSWORD
+          $dur = '${{ inputs.duration_minutes }}'
+          $tick = [char]0x60
+          $fence = ($tick.ToString() * 3)
+
+          $lines = @()
+          $lines += '# 🪟 Free Windows RDP Server — Live'
+          $lines += ''
+          $lines += '> 100٪ مجاني — لا Ngrok ، لا API ، لا حساب ، لا Secrets.'
+          $lines += '> Windows Server 2022 (Desktop Experience) — تبدو مثل Windows 11.'
+          $lines += ''
+          $lines += '## 🔑 معلومات تسجيل الدخول'
+          $lines += ''
+          $lines += '| الحقل | القيمة |'
+          $lines += '|------|--------|'
+          $lines += "| **PC name (Host:Port)** | $tick$h`:$p$tick |"
+          $lines += "| **Username**            | $tick$u$tick |"
+          $lines += "| **Password**            | $tick$pw$tick |"
+          $lines += '| **OS**                  | Windows Server 2022 (Desktop Experience) |'
+          $lines += '| **Tunnel**              | bore.pub (auto-restart watchdog) |'
+          $lines += "| **Duration**            | $dur min |"
+          $lines += ''
+          $lines += '> ⚠️ إذا انقطع نفق bore، الـ watchdog يُعيد تشغيله تلقائياً. '
+          $lines += '> رقم المنفذ قد يتغيّر بعد إعادة الاتصال — راجع لوج الـ job.'
+          $lines += ''
+          $lines += '## كيف تتصل'
+          $lines += ''
+          $lines += '### 🪟 Windows (mstsc)'
+          $lines += $fence
+          $lines += "mstsc /v:$h`:$p"
+          $lines += $fence
+          $lines += ''
+          $lines += '### 📱 Android — تطبيق **Windows App**'
+          $lines += '1. افتح التطبيق → **+** → **Add PC**'
+          $lines += "2. **PC name** : $tick$h`:$p$tick"
+          $lines += "3. **User account** : $tick$u$tick + كلمة المرور أعلاه"
+          $lines += '4. اضغط **Save** ثم على البطاقة للاتصال.'
+          $lines += ''
+          $lines += '### 🍎 iOS / macOS — Windows App'
+          $lines += 'نفس الخطوات.'
+          $lines += ''
+          $lines += '### 🐧 Linux — FreeRDP'
+          $lines += $fence
+          $lines += "xfreerdp /v:$h`:$p /u:$u /p:'$pw' /size:1280x800 /cert:ignore"
+          $lines += $fence
+
+          $lines -join "`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      # ----------------------------------------------------------------------
+      - name: ⏳ Keep RDP session alive (tolerant + auto-recover)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $durationMin = [int]'${{ inputs.duration_minutes }}'
+          $durationSec = $durationMin * 60
+          if ($durationSec -gt 21000) { $durationSec = 21000 }
+
+          Write-Host "🟢 Session will run for $($durationSec/60) minutes."
+          Write-Host "   Host:$($env:RDP_HOST)  Port:$($env:RDP_PORT)  User:$($env:RDP_USERNAME)"
+
+          $elapsed = 0
+          $step    = 120
+          $lastPort = $env:RDP_PORT
+          $boreDownCount = 0
+
+          $watchdogPidFile = "$env:RUNNER_TEMP\watchdog.pid"
+          $boreLog         = "$env:RUNNER_TEMP\bore.log"
+          $watchdogLog     = "$env:RUNNER_TEMP\watchdog.log"
+
+          while ($elapsed -lt $durationSec) {
+            Start-Sleep -Seconds $step
+            $elapsed += $step
+            $remainMin = [math]::Floor(($durationSec - $elapsed) / 60)
+
+            # 1) فحص خدمة RDP — حاول إعادة التشغيل قبل الإفشال
+            $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            if (-not $svc -or $svc.Status -ne 'Running') {
+              Write-Host "::warning::TermService not running — restarting"
+              try { Start-Service -Name TermService -ErrorAction Stop } catch {
+                Write-Error "::error::Could not restart TermService: $($_.Exception.Message)"
+                exit 1
+              }
+              Start-Sleep -Seconds 3
+            }
+
+            # 2) فحص استماع 3389
+            $listening = Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue
+            if (-not $listening) {
+              Write-Host "::warning::Port 3389 not listening — restarting TermService"
+              try { Restart-Service -Name TermService -Force -ErrorAction Stop } catch {}
+              Start-Sleep -Seconds 3
+            }
+
+            # 3) فحص الـ watchdog (هو الذي يُحيي bore تلقائياً)
+            $watchdogAlive = $false
+            if (Test-Path $watchdogPidFile) {
+              $wpid = Get-Content $watchdogPidFile
+              $wproc = Get-Process -Id $wpid -ErrorAction SilentlyContinue
+              if ($wproc) { $watchdogAlive = $true }
+            }
+            if (-not $watchdogAlive) {
+              Write-Error "::error::bore watchdog died — cannot recover"
+              if (Test-Path $watchdogLog) { Get-Content -Tail 60 $watchdogLog }
+              if (Test-Path $boreLog)     { Get-Content -Tail 60 $boreLog }
+              exit 1
+            }
+
+            # 4) فحص bore (متسامح) — نراقب بالـ name لا بالـ PID
+            $boreProc = Get-Process -Name 'bore' -ErrorAction SilentlyContinue
+            if ($boreProc) {
+              $boreDownCount = 0
+            } else {
+              $boreDownCount++
+              Write-Host "::warning::bore process not visible (count=$boreDownCount) — watchdog سيُعيده قريباً"
+            }
+
+            # 5) اقرأ آخر منفذ من لوج bore — أبلغ إذا تغيّر
+            if (Test-Path $boreLog) {
+              $logTxt = Get-Content -Raw $boreLog -ErrorAction SilentlyContinue
+              if ($logTxt) {
+                $matches = [regex]::Matches($logTxt, 'listening at bore\.pub:(\d+)')
+                if ($matches.Count -gt 0) {
+                  $curPort = $matches[$matches.Count - 1].Groups[1].Value
+                  if ($curPort -ne $lastPort) {
+                    Write-Host "::warning::🔄 bore port changed: $lastPort -> $curPort"
+                    "🔄 NEW connection: $($env:RDP_HOST):$curPort" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+                    $lastPort = $curPort
+                  }
+                }
+              }
+            }
+
+            Write-Host ("⏱️  elapsed={0}min  remaining={1}min   {2}:{3}" -f ($elapsed/60), $remainMin, $env:RDP_HOST, $lastPort)
+          }
+
+          Write-Host "✅ Reached scheduled duration."
+
+      # ----------------------------------------------------------------------
+      - name: 📜 Debug logs (always)
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Write-Host "===== bore log (tail) ====="
+          if (Test-Path "$env:RUNNER_TEMP\bore.log")     { Get-Content -Tail 80 "$env:RUNNER_TEMP\bore.log" }
+          if (Test-Path "$env:RUNNER_TEMP\bore.log.err") { Get-Content -Tail 80 "$env:RUNNER_TEMP\bore.log.err" }
+          Write-Host ""
+          Write-Host "===== watchdog log (tail) ====="
+          if (Test-Path "$env:RUNNER_TEMP\watchdog.log") { Get-Content -Tail 60 "$env:RUNNER_TEMP\watchdog.log" }
+          Write-Host ""
+          Write-Host "===== Listening TCP ports ====="
+          Get-NetTCPConnection -State Listen | Sort-Object LocalPort | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table | Out-String | Write-Host
+          Write-Host ""
+          Write-Host "===== TermService status ====="
+          Get-Service -Name TermService | Format-List | Out-String | Write-Host
+
+      # ----------------------------------------------------------------------
+      - name: 🧹 Cleanup
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          # أوقف watchdog أولاً، ثم bore
+          $watchdogPidFile = "$env:RUNNER_TEMP\watchdog.pid"
+          if (Test-Path $watchdogPidFile) {
+            $wpid = Get-Content $watchdogPidFile
+            try { Stop-Process -Id $wpid -Force -ErrorAction SilentlyContinue } catch {}
+          }
+          Get-Process -Name 'bore' -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+          }
