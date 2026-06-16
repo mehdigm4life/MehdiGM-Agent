@@ -1,0 +1,467 @@
+name: 🦙 Ollama AI Cloud (Web)
+
+# يعمل هذا الـ workflow على أي repository تضع فيه هذا الملف
+# المسار المطلوب: .github/workflows/ollama.yml
+# يقوم بتثبيت Ollama + Open WebUI كاملاً على Ubuntu runner ويفتح Web UI
+# عبر Cloudflare Tunnel (TryCloudflare) — يطبع رابط عام يمكنك الدخول منه
+# والتحدث مع النماذج المحلية مجاناً بدون أي API keys.
+# أي تعديل على ملفات الـ repo يتم commit + push تلقائياً.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "كم دقيقة يبقى السيرفر شغّال (الحد الأقصى لـ GitHub Actions = 350 دقيقة ≈ 6 ساعات)"
+        required: true
+        default: "350"
+        type: string
+      models:
+        description: "النماذج التي تريد تحميلها (مفصولة بفواصل). أمثلة: llama3.2:1b, llama3.2:3b, qwen2.5:3b, phi3:mini, gemma2:2b, tinyllama"
+        required: true
+        default: "llama3.2:1b,qwen2.5:3b"
+        type: string
+      auto_commit:
+        description: "هل تريد commit + push تلقائي لأي تعديلات على الملفات؟"
+        required: true
+        default: true
+        type: boolean
+      commit_interval_seconds:
+        description: "كل كم ثانية يتم فحص التغييرات وعمل commit (افتراضي 60 ثانية)"
+        required: true
+        default: "60"
+        type: string
+      enable_web_ui:
+        description: "تفعيل Open WebUI (واجهة ويب جميلة شبيهة بـ ChatGPT). إذا false سيتم فتح Ollama API فقط."
+        required: true
+        default: true
+        type: boolean
+
+# نحتاج صلاحية الكتابة على المحتوى لعمل push
+permissions:
+  contents: write
+
+jobs:
+  ollama-web:
+    name: 🚀 Run Ollama + Open WebUI + Cloudflare Tunnel
+    runs-on: ubuntu-latest
+    # الحد الأقصى لـ job في GitHub Actions = 360 دقيقة
+    timeout-minutes: 355
+
+    env:
+      # ===== إعدادات Ollama =====
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_ORIGINS: "*"
+      OLLAMA_KEEP_ALIVE: "24h"
+      # ===== إعدادات Open WebUI =====
+      WEBUI_PORT: "8080"
+      WEBUI_AUTH: "False"   # نلغي تسجيل الدخول لأن الجلسة مؤقتة
+      ENABLE_SIGNUP: "False"
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1) جلب كود الـ repository الحالي
+      # -----------------------------------------------------------------------
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # 2) تثبيت الأدوات المساعدة
+      # -----------------------------------------------------------------------
+      - name: 🛠️ Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl unzip jq git ca-certificates procps python3 python3-pip python3-venv
+
+      # -----------------------------------------------------------------------
+      # 3) تثبيت Ollama عبر السكريبت الرسمي
+      # -----------------------------------------------------------------------
+      - name: 🦙 Install Ollama (official installer)
+        run: |
+          set -e
+          echo "::group::Installing Ollama via official installer"
+          curl -fsSL https://ollama.com/install.sh | sh
+          echo "::endgroup::"
+
+          which ollama || true
+          ollama --version || true
+
+      # -----------------------------------------------------------------------
+      # 4) تثبيت cloudflared
+      # -----------------------------------------------------------------------
+      - name: ☁️ Install cloudflared
+        uses: AnimMouse/setup-cloudflared@v2
+
+      - name: ✅ Verify cloudflared
+        run: cloudflared --version
+
+      # -----------------------------------------------------------------------
+      # 5) تشغيل Ollama serve في الخلفية
+      # -----------------------------------------------------------------------
+      - name: 🚀 Start Ollama server (background)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/ollama-logs"
+          LOG_FILE="$RUNNER_TEMP/ollama-logs/server.log"
+          : > "$LOG_FILE"
+
+          echo "Starting ollama serve on 0.0.0.0:11434 ..."
+
+          # setsid + redirect + disown لمنع تعليق الخطوة
+          setsid bash -c "OLLAMA_HOST='0.0.0.0:11434' OLLAMA_ORIGINS='*' OLLAMA_KEEP_ALIVE='24h' ollama serve </dev/null >>'$LOG_FILE' 2>&1" &
+          OLLAMA_PID=$!
+          disown || true
+
+          echo "$OLLAMA_PID" > "$RUNNER_TEMP/ollama.pid"
+          echo "Ollama PID = $OLLAMA_PID"
+
+          # ننتظر حتى يستجيب على المنفذ
+          UP=0
+          for i in $(seq 1 120); do
+            # API endpoint الرسمي
+            if curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              UP=1; echo "✅ Ollama /api/tags responded after ${i}s"; break
+            fi
+            # fallback: فحص الصفحة الجذرية
+            if curl -fsS --max-time 2 http://127.0.0.1:11434/ >/dev/null 2>&1; then
+              UP=1; echo "✅ Ollama root responded after ${i}s"; break
+            fi
+            # تحقق أن العملية ما زالت حية
+            if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
+              echo "❌ Ollama process exited prematurely. Logs:"
+              cat "$LOG_FILE" || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$UP" -ne 1 ]; then
+            echo "❌ Ollama failed to become reachable in 120s. Logs:"
+            tail -n 200 "$LOG_FILE" || true
+            kill -TERM "$OLLAMA_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "----- last 30 lines of Ollama log -----"
+          tail -n 30 "$LOG_FILE" || true
+
+      # -----------------------------------------------------------------------
+      # 6) تحميل النماذج المطلوبة
+      # -----------------------------------------------------------------------
+      - name: 📦 Pull Ollama models
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          MODELS="${{ github.event.inputs.models }}"
+          echo "Models to pull: $MODELS"
+
+          IFS=',' read -ra MODEL_ARR <<< "$MODELS"
+          for raw in "${MODEL_ARR[@]}"; do
+            # إزالة المسافات
+            model="$(echo "$raw" | xargs)"
+            if [ -z "$model" ]; then
+              continue
+            fi
+            echo ""
+            echo "============================================"
+            echo "📥 Pulling model: $model"
+            echo "============================================"
+            if ! ollama pull "$model"; then
+              echo "⚠️ Failed to pull $model — continuing with others"
+            fi
+          done
+
+          echo ""
+          echo "===== Installed models ====="
+          ollama list || true
+
+      # -----------------------------------------------------------------------
+      # 7) تثبيت وتشغيل Open WebUI (اختياري)
+      # -----------------------------------------------------------------------
+      - name: 🎨 Install & Start Open WebUI (background)
+        if: ${{ github.event.inputs.enable_web_ui == 'true' }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          echo "::group::Installing Open WebUI via pip"
+          python3 -m venv "$HOME/openwebui-venv"
+          # shellcheck disable=SC1091
+          source "$HOME/openwebui-venv/bin/activate"
+          pip install --quiet --upgrade pip
+          pip install --quiet open-webui
+          echo "::endgroup::"
+
+          mkdir -p "$RUNNER_TEMP/webui-logs"
+          WEBUI_LOG="$RUNNER_TEMP/webui-logs/webui.log"
+          : > "$WEBUI_LOG"
+
+          # حفظ مسار python venv للخطوات اللاحقة
+          echo "$HOME/openwebui-venv/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/openwebui-venv/bin:$PATH"
+
+          echo "Starting Open WebUI on 0.0.0.0:8080 ..."
+
+          # تشغيل Open WebUI مع تعطيل auth والإشارة إلى Ollama المحلي
+          setsid bash -c "WEBUI_AUTH=False ENABLE_SIGNUP=False OLLAMA_BASE_URL='http://127.0.0.1:11434' open-webui serve --host 0.0.0.0 --port 8080 </dev/null >>'$WEBUI_LOG' 2>&1" &
+          WEBUI_PID=$!
+          disown || true
+
+          echo "$WEBUI_PID" > "$RUNNER_TEMP/webui.pid"
+          echo "Open WebUI PID = $WEBUI_PID"
+
+          # ننتظر حتى يستجيب
+          UP=0
+          for i in $(seq 1 180); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:8080/ || echo "000")
+            if [ "$CODE" != "000" ] && [ "$CODE" != "502" ] && [ "$CODE" != "503" ]; then
+              UP=1; echo "✅ Open WebUI responded with HTTP $CODE after ${i}s"; break
+            fi
+            if ! kill -0 "$WEBUI_PID" 2>/dev/null; then
+              echo "❌ Open WebUI process exited prematurely. Logs:"
+              tail -n 200 "$WEBUI_LOG" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ "$UP" -ne 1 ]; then
+            echo "❌ Open WebUI failed to start in 360s. Logs:"
+            tail -n 200 "$WEBUI_LOG" || true
+            kill -TERM "$WEBUI_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "----- last 30 lines of Open WebUI log -----"
+          tail -n 30 "$WEBUI_LOG" || true
+
+      # -----------------------------------------------------------------------
+      # 8) فتح Cloudflare Quick Tunnel
+      # -----------------------------------------------------------------------
+      - name: 🌐 Start Cloudflare Quick Tunnel
+        id: tunnel
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cloudflared-logs"
+          TUN_LOG="$RUNNER_TEMP/cloudflared-logs/tunnel.log"
+          : > "$TUN_LOG"
+
+          # نختار المنفذ حسب الإعداد:
+          # - إذا Open WebUI مفعل → 8080
+          # - وإلا → 11434 (Ollama API مباشرة)
+          if [ "${{ github.event.inputs.enable_web_ui }}" = "true" ]; then
+            TARGET_PORT=8080
+            MODE="Open WebUI"
+          else
+            TARGET_PORT=11434
+            MODE="Ollama API"
+          fi
+
+          echo "Tunneling http://127.0.0.1:${TARGET_PORT} (${MODE})"
+
+          setsid bash -c "cloudflared tunnel --no-autoupdate --url http://127.0.0.1:${TARGET_PORT} </dev/null >>'$TUN_LOG' 2>&1" &
+          TUN_PID=$!
+          disown || true
+          echo "$TUN_PID" > "$RUNNER_TEMP/cloudflared.pid"
+          echo "cloudflared PID = $TUN_PID"
+
+          # استخراج الرابط https://*.trycloudflare.com من اللوج
+          PUBLIC_URL=""
+          for i in $(seq 1 90); do
+            if grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUN_LOG" | head -n1 > /tmp/url.txt 2>/dev/null; then
+              PUBLIC_URL=$(cat /tmp/url.txt || true)
+              if [ -n "$PUBLIC_URL" ]; then break; fi
+            fi
+            if ! kill -0 "$TUN_PID" 2>/dev/null; then
+              echo "❌ cloudflared exited prematurely. Logs:"
+              cat "$TUN_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ -z "$PUBLIC_URL" ]; then
+            echo "❌ Failed to get tunnel URL in 90s. Tunnel log:"
+            cat "$TUN_LOG"
+            exit 1
+          fi
+
+          echo "PUBLIC_URL=$PUBLIC_URL" >> "$GITHUB_ENV"
+          echo "TARGET_MODE=$MODE"      >> "$GITHUB_ENV"
+          echo "public_url=$PUBLIC_URL" >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║              🎉 Ollama AI is LIVE on the Web 🎉                ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          printf  "║  URL:  %-55s ║\n" "$PUBLIC_URL"
+          printf  "║  Mode: %-55s ║\n" "$MODE"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      # -----------------------------------------------------------------------
+      # 9) كتابة الرابط في Summary
+      # -----------------------------------------------------------------------
+      - name: 📌 Publish URL to Job Summary
+        run: |
+          {
+            echo "# 🦙 Ollama AI — Live Session"
+            echo ""
+            echo "## 🌐 الرابط العام"
+            echo ""
+            echo "### 👉 [${PUBLIC_URL}](${PUBLIC_URL})"
+            echo ""
+            if [ "${{ github.event.inputs.enable_web_ui }}" = "true" ]; then
+              echo "**الوضع:** Open WebUI (واجهة شبيهة بـ ChatGPT 🎨)"
+              echo ""
+              echo "- افتح الرابط أعلاه مباشرة في المتصفح"
+              echo "- اختر النموذج من القائمة العلوية وابدأ المحادثة"
+            else
+              echo "**الوضع:** Ollama API مباشرة"
+              echo ""
+              echo "- API root: \`${PUBLIC_URL}\`"
+              echo "- List models: \`GET ${PUBLIC_URL}/api/tags\`"
+              echo "- Chat:        \`POST ${PUBLIC_URL}/api/chat\`"
+              echo "- Generate:    \`POST ${PUBLIC_URL}/api/generate\`"
+              echo ""
+              echo "مثال:"
+              echo '```bash'
+              echo "curl ${PUBLIC_URL}/api/generate -d '{\"model\":\"llama3.2:1b\",\"prompt\":\"Hello\",\"stream\":false}'"
+              echo '```'
+            fi
+            echo ""
+            echo "| الحقل | القيمة |"
+            echo "|------|--------|"
+            echo "| **Repository** | \`${GITHUB_REPOSITORY}\` |"
+            echo "| **Branch** | \`${GITHUB_REF_NAME}\` |"
+            echo "| **مدة التشغيل** | ${{ github.event.inputs.duration_minutes }} دقيقة |"
+            echo "| **النماذج** | \`${{ github.event.inputs.models }}\` |"
+            echo "| **Auto commit** | ${{ github.event.inputs.auto_commit }} |"
+            echo "| **Open WebUI** | ${{ github.event.inputs.enable_web_ui }} |"
+            echo ""
+            echo "## 🛑 لإيقاف الجلسة"
+            echo "اضغط على زر **Cancel workflow** في صفحة الـ Actions."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 10) Auto-commit loop في الخلفية
+      # -----------------------------------------------------------------------
+      - name: 🔁 Start auto-commit loop (background)
+        if: ${{ github.event.inputs.auto_commit == 'true' }}
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          git config --global user.email "ollama-bot@users.noreply.github.com"
+          git config --global user.name  "ollama-bot"
+
+          INTERVAL="${{ github.event.inputs.commit_interval_seconds }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          LOG="$RUNNER_TEMP/autocommit.log"
+          : > "$LOG"
+
+          cat > "$RUNNER_TEMP/autocommit.sh" <<EOF
+          #!/usr/bin/env bash
+          cd "$GITHUB_WORKSPACE"
+          while true; do
+            sleep $INTERVAL
+            if [ -n "\$(git status --porcelain)" ]; then
+              git add -A
+              MSG="🦙 ollama: auto-commit \$(date -u +'%Y-%m-%d %H:%M:%SZ')"
+              git commit -m "\$MSG" >> "$LOG" 2>&1 || true
+              git push origin "$BRANCH" >> "$LOG" 2>&1 || true
+              echo "[\$(date -u)] pushed: \$MSG" >> "$LOG"
+            fi
+          done
+          EOF
+          chmod +x "$RUNNER_TEMP/autocommit.sh"
+
+          setsid bash -c "bash '$RUNNER_TEMP/autocommit.sh' </dev/null >>'$LOG' 2>&1" &
+          AC_PID=$!
+          disown || true
+          echo "$AC_PID" > "$RUNNER_TEMP/autocommit.pid"
+          echo "✅ Auto-commit loop started (PID=$AC_PID, every ${INTERVAL}s) on branch ${BRANCH}"
+
+      # -----------------------------------------------------------------------
+      # 11) إبقاء الـ job حياً للمدة المطلوبة
+      # -----------------------------------------------------------------------
+      - name: ⏳ Keep session alive
+        run: |
+          DURATION_MIN="${{ github.event.inputs.duration_minutes }}"
+          DURATION_SEC=$(( DURATION_MIN * 60 ))
+          echo "Session will run for ${DURATION_MIN} minutes (${DURATION_SEC}s)."
+          echo "Public URL: ${PUBLIC_URL}"
+          echo ""
+
+          ELAPSED=0
+          STEP=300   # 5 minutes
+          while [ "$ELAPSED" -lt "$DURATION_SEC" ]; do
+            sleep "$STEP"
+            ELAPSED=$(( ELAPSED + STEP ))
+            REMAIN_MIN=$(( (DURATION_SEC - ELAPSED) / 60 ))
+            echo "⏱️ Heartbeat — elapsed=$((ELAPSED/60))min  remaining=${REMAIN_MIN}min"
+            echo "🌐 ${PUBLIC_URL}"
+
+            if [ -f "$RUNNER_TEMP/ollama.pid" ] && ! kill -0 "$(cat $RUNNER_TEMP/ollama.pid)" 2>/dev/null; then
+              echo "⚠️ Ollama process died — exiting."
+              exit 1
+            fi
+            if [ -f "$RUNNER_TEMP/cloudflared.pid" ] && ! kill -0 "$(cat $RUNNER_TEMP/cloudflared.pid)" 2>/dev/null; then
+              echo "⚠️ cloudflared process died — exiting."
+              exit 1
+            fi
+            if [ "${{ github.event.inputs.enable_web_ui }}" = "true" ] && [ -f "$RUNNER_TEMP/webui.pid" ]; then
+              if ! kill -0 "$(cat $RUNNER_TEMP/webui.pid)" 2>/dev/null; then
+                echo "⚠️ Open WebUI process died — exiting."
+                exit 1
+              fi
+            fi
+          done
+
+          echo "✅ Session duration reached. Shutting down."
+
+      # -----------------------------------------------------------------------
+      # 12) commit أخير
+      # -----------------------------------------------------------------------
+      - name: 💾 Final commit & push
+        if: ${{ always() && github.event.inputs.auto_commit == 'true' }}
+        run: |
+          cd "$GITHUB_WORKSPACE" || exit 1
+          git config --global user.email "ollama-bot@users.noreply.github.com"
+          git config --global user.name  "ollama-bot"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "🦙 ollama: final auto-commit $(date -u +'%Y-%m-%d %H:%M:%SZ')" || true
+            git push origin "${GITHUB_REF_NAME}" || true
+          else
+            echo "No pending changes to commit."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 13) عرض اللوجات
+      # -----------------------------------------------------------------------
+      - name: 📜 Show logs (debug)
+        if: ${{ always() }}
+        run: |
+          echo "===== Ollama server log (tail 100) ====="
+          tail -n 100 "$RUNNER_TEMP/ollama-logs/server.log" 2>/dev/null || true
+          echo ""
+          echo "===== Open WebUI log (tail 80) ====="
+          tail -n 80  "$RUNNER_TEMP/webui-logs/webui.log" 2>/dev/null || true
+          echo ""
+          echo "===== cloudflared tunnel log (tail 60) ====="
+          tail -n 60  "$RUNNER_TEMP/cloudflared-logs/tunnel.log" 2>/dev/null || true
+          echo ""
+          echo "===== autocommit log (tail 60) ====="
+          tail -n 60  "$RUNNER_TEMP/autocommit.log" 2>/dev/null || true
+
+      # -----------------------------------------------------------------------
+      # 14) إغلاق نظيف
+      # -----------------------------------------------------------------------
+      - name: 🧹 Shutdown cloudflared
+        if: ${{ always() }}
+        uses: AnimMouse/setup-cloudflared/shutdown@v2
